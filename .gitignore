@@ -1,0 +1,7 @@
+.DS_Store
+*.out
+*.test
+**/project-explorer.html
+/.vscode/
+/bin/
+/emulator-router
