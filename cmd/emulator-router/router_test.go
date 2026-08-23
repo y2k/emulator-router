@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -824,7 +825,10 @@ func TestBashSubstitution(t *testing.T) {
 	cmd := "cd app && adb -s emulator-9999 install x.apk && adb -e shell ls && adb -s emulator-8888 logcat"
 	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, cmd))
 	got := decode(t, out)
-	updated := got.UpdatedInput["command"]
+	updated, _ := got.UpdatedInput["command"].(string)
+	if len(got.UpdatedInput) != 1 {
+		t.Errorf("во вводе была только команда, а решение содержит %v", got.UpdatedInput)
+	}
 
 	if strings.Contains(updated, "emulator-9999") || strings.Contains(updated, "emulator-8888") {
 		t.Errorf("заменены не все вхождения: %q", updated)
@@ -877,7 +881,7 @@ func TestWrapperGetsNoAppendedArguments(t *testing.T) {
 	c, f := newTestConfig(t)
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
 	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "./wrapper.sh check"))
-	updated := decode(t, out).UpdatedInput["command"]
+	updated, _ := decode(t, out).UpdatedInput["command"].(string)
 	if !strings.HasSuffix(updated, "./wrapper.sh check") {
 		t.Errorf("к вызову обёртки не должно дописываться ничего: %q", updated)
 	}
@@ -896,6 +900,59 @@ func TestMobileMCPDeviceRewrite(t *testing.T) {
 		if got := decode(t, out).UpdatedInput["device"]; got != "emulator-15556" {
 			t.Errorf("tool_input=%v: device=%q, ожидался emulator-15556", ti, got)
 		}
+	}
+}
+
+// Изменённый ввод заменяет ввод вызова целиком, а не сливается с ним по полям,
+// поэтому потерянный обязательный аргумент делает вызов негодным по схеме самого
+// инструмента, а выдуманное поле неотличимо от заданного вызывающей стороной.
+func TestMobileMCPKeepsOtherArguments(t *testing.T) {
+	cwd := worktreeDir(t)
+	// Числа и булево значение проходят через JSON, поэтому строковая карта их не
+	// унесла бы: тип аргумента задаёт схема инструмента, а не роутер.
+	for _, tc := range []struct{ in, want map[string]any }{
+		{
+			in:   map[string]any{"device": "emulator-9999", "x": 100.0, "y": 200.5, "submit": true, "text": "hi"},
+			want: map[string]any{"device": "emulator-15556", "x": 100.0, "y": 200.5, "submit": true, "text": "hi"},
+		},
+		{in: nil, want: map[string]any{"device": "emulator-15556"}},
+	} {
+		c, f := newTestConfig(t)
+		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
+		in := hookJSON(t, "PreToolUse", "s1", cwd, "mcp__mobile-mcp__mobile_click_on_screen_at_coordinates", tc.in)
+		_, out, _ := runHook(t, c, in)
+		if got := decode(t, out).UpdatedInput; !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("tool_input=%v: решение содержит %v, ожидалось %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Признак фонового исполнения и предел времени меняют способ исполнения команды:
+// потеряв их, роутер превращает фоновую сборку в синхронную.
+func TestBashKeepsOtherArguments(t *testing.T) {
+	c, f := newTestConfig(t)
+	cwd := worktreeDir(t)
+	seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
+
+	in := hookJSON(t, "PreToolUse", "s1", cwd, "Bash", map[string]any{
+		"command":           "adb logcat",
+		"run_in_background": true,
+		"timeout":           600000.0,
+		"description":       "read the log",
+	})
+	_, out, _ := runHook(t, c, in)
+	updated := decode(t, out).UpdatedInput
+
+	for k, want := range map[string]any{"run_in_background": true, "timeout": 600000.0, "description": "read the log"} {
+		if updated[k] != want {
+			t.Errorf("поле %q не дошло без изменений: решение содержит %v", k, updated)
+		}
+	}
+	if cmd, _ := updated["command"].(string); !strings.Contains(cmd, "emulator-15556") {
+		t.Errorf("команда не привязана к инстансу: %q", cmd)
+	}
+	if len(updated) != 4 {
+		t.Errorf("состав полей изменился: %v", updated)
 	}
 }
 

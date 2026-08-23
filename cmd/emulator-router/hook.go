@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"regexp"
 	"strconv"
@@ -20,11 +21,11 @@ type hookInput struct {
 }
 
 type hookSpecific struct {
-	HookEventName            string            `json:"hookEventName,omitempty"`
-	PermissionDecision       string            `json:"permissionDecision,omitempty"`
-	PermissionDecisionReason string            `json:"permissionDecisionReason,omitempty"`
-	UpdatedInput             map[string]string `json:"updatedInput,omitempty"`
-	AdditionalContext        string            `json:"additionalContext,omitempty"`
+	HookEventName            string         `json:"hookEventName,omitempty"`
+	PermissionDecision       string         `json:"permissionDecision,omitempty"`
+	PermissionDecisionReason string         `json:"permissionDecisionReason,omitempty"`
+	UpdatedInput             map[string]any `json:"updatedInput,omitempty"`
+	AdditionalContext        string         `json:"additionalContext,omitempty"`
 }
 
 type hookOut struct {
@@ -124,7 +125,7 @@ func hook(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return deny(stdout, "No emulator for this session: "+err.Error())
 		}
-		return emit(stdout, hookSpecific{UpdatedInput: map[string]string{"device": serial}})
+		return emit(stdout, hookSpecific{UpdatedInput: withOverride(in.ToolInput, "device", serial)})
 	}
 	return 0 // неизвестный инструмент это неверный matcher, а не отказ пула
 }
@@ -167,9 +168,21 @@ func bashCall(ctx context.Context, in hookInput, cwd string, stdout, stderr io.W
 	// `export ...; cmd`, а не `VAR=x cmd`: префикс привязывается только к первой
 	// простой команде, поэтому в `cd app && adb install ...` до adb не дойдёт.
 	return emit(stdout, hookSpecific{
-		UpdatedInput:      map[string]string{"command": "export ANDROID_SERIAL=" + serial + " ADB_SERIAL=" + serial + "; " + cmd},
+		UpdatedInput:      withOverride(in.ToolInput, "command", "export ANDROID_SERIAL="+serial+" ADB_SERIAL="+serial+"; "+cmd),
 		AdditionalContext: "This session owns emulator " + serial + ". Use it for every device call.",
 	})
+}
+
+// withOverride: изменённый ввод заменяет ввод вызова целиком, а не сливается с
+// ним по полям, поэтому непереопределённые аргументы переносятся сюда сами. Без
+// них вызов негоден по схеме своего инструмента: у Mobile-MCP пропали бы
+// обязательные аргументы, у оболочки — признак фонового исполнения и предел
+// времени. Копия, а не правка на месте: разобранный ввод остаётся тем, что пришло.
+func withOverride(in map[string]any, key string, value any) map[string]any {
+	out := make(map[string]any, len(in)+1)
+	maps.Copy(out, in)
+	out[key] = value
+	return out
 }
 
 // emit: имя события обязательно в любом решении, а не только в отказе. Claude
