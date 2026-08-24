@@ -107,13 +107,16 @@ func sdkPath(home string) string {
 // при установке всё равно приходится править.
 var settingsFile = filepath.Join(".claude", "emulator-router.json")
 
-// settings — настройки проекта. Указатели у необязательных полей отличают
-// «не задано» от заданного нулевого значения: `"max": 0` — ошибка настройки, а
-// не молчаливый возврат к дефолту.
+// settings — настройки проекта. Здесь только то, что различается между
+// проектами: предел инстансов и ускоритель графики свойства машины и образа, а
+// не проекта, и настройками не являются — заданные, они делают файл негодным как
+// незнакомые поля.
+//
+// Указатель у необязательного поля отличает «не задано» от заданного нулевого
+// значения: `"mainCheckout": false` — заданное значение, совпадающее с
+// умолчанием, а не молчаливый возврат к нему.
 type settings struct {
 	AVD          string   `json:"avd"`
-	Max          *int     `json:"max"`
-	GPU          *string  `json:"gpu"`
 	Reach        []string `json:"reach"`
 	MainCheckout *bool    `json:"mainCheckout"`
 }
@@ -216,15 +219,6 @@ func applySettings(c config, path string) (config, error) {
 	}
 
 	c.AVD = s.AVD
-	if s.Max != nil {
-		if *s.Max < 1 {
-			return c, fmt.Errorf(`%s: field "max" must be at least 1, got %d`, path, *s.Max)
-		}
-		c.Max = *s.Max
-	}
-	if s.GPU != nil {
-		c.GPU = *s.GPU
-	}
 	if s.MainCheckout != nil {
 		c.MainCheckout = *s.MainCheckout
 	}

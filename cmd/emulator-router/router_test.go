@@ -450,24 +450,31 @@ func TestSettingsDefaults(t *testing.T) {
 
 func TestSettingsOverrideDefaults(t *testing.T) {
 	dir := t.TempDir()
-	path := writeSettings(t, dir, `{"avd": "img", "max": 1, "gpu": "swiftshader_indirect", "mainCheckout": true, "reach": ["wrapper\\.sh"]}`)
+	path := writeSettings(t, dir, `{"avd": "img", "mainCheckout": true, "reach": ["wrapper\\.sh"]}`)
 	c, err := applySettings(defaultConfig(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Max != 1 || c.GPU != "swiftshader_indirect" || !c.MainCheckout || len(c.Reach) != 1 {
+	if !c.MainCheckout || len(c.Reach) != 1 {
 		t.Errorf("настройки не применились: %+v", c)
+	}
+	// Предел и ускоритель настройками не переопределяются вовсе.
+	if c.Max != 3 || c.GPU != "host" {
+		t.Errorf("машинные значения изменились: max %d, gpu %q", c.Max, c.GPU)
 	}
 }
 
 func TestSettingsRejectBadFiles(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{"неразбираемое содержимое", `{не json`, "invalid character"},
-		{"нет обязательного поля", `{"max": 2}`, `"avd" is required`},
+		{"нет обязательного поля", `{}`, `"avd" is required`},
 		{"незнакомое поле", `{"avd": "img", "maxx": 2}`, "maxx"},
-		{"неподходящий тип", `{"avd": "img", "max": "три"}`, "max"},
+		{"неподходящий тип", `{"avd": 5}`, "avd"},
 		{"негодная регулярка", `{"avd": "img", "reach": ["([unclosed"]}`, "([unclosed"},
-		{"предел меньше единицы", `{"avd": "img", "max": 0}`, "at least 1"},
+		// Предел и ускоритель настройками проекта не являются, поэтому заданными
+		// делают файл негодным наравне с опечаткой в имени поля.
+		{"задан предел инстансов", `{"avd": "img", "max": 3}`, "max"},
+		{"задан ускоритель графики", `{"avd": "img", "gpu": "host"}`, "gpu"},
 	}
 	for _, tc := range cases {
 		path := writeSettings(t, t.TempDir(), tc.body)

@@ -60,8 +60,6 @@ over the repository's.
 ```json
 {
   "avd": "my_agent_avd",
-  "max": 3,
-  "gpu": "host",
   "reach": ["deploy\\.sh", "tools[^ ]*\\.kts"],
   "mainCheckout": false
 }
@@ -70,10 +68,15 @@ over the repository's.
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `avd` | — | **Required.** Name of the prepared AVD the pool clones. No default exists. |
-| `max` | `3` | Cap on simultaneously held instances. |
-| `gpu` | `host` | Value passed to `emulator -gpu`. Some Linux hosts need `swiftshader_indirect`. |
 | `reach` | `[]` | Extra command words that reach the emulator (see below). |
 | `mainCheckout` | `false` | Serve the main checkout too, not just linked worktrees. |
+
+Only what differs between projects is configurable. The instance cap and the
+renderer are not: how many instances fit is a property of the machine's memory
+and disk, and the renderer must match the one recorded in the AVD's boot
+snapshot or the snapshot fails to load and every instance silently cold boots.
+Both are fixed at `3` and `host`, and setting either one in the file makes it
+unusable, exactly like a typo in a field name.
 
 A found-but-unusable file is a hard error: unparsable JSON, a missing `avd`, an
 unknown field, a wrong type, or an invalid `reach` pattern all block the tool

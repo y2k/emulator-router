@@ -117,8 +117,10 @@ func staticChecks(ctx context.Context, cwd string) (config, report) {
 		return c, r
 	}
 	c = applied
-	r.add(pass, "settings: %s (avd %q, max %d, gpu %q, %d configured wrappers)",
-		path, c.AVD, c.Max, c.GPU, len(c.Reach))
+	// Предел и ускоритель здесь не называются: настройками проекта они не
+	// являются. Оба и так попадают в отчёт — предел в проверке места на диске,
+	// ускоритель в проверке снапшота.
+	r.add(pass, "settings: %s (avd %q, %d configured wrappers)", path, c.AVD, len(c.Reach))
 
 	r = append(r, wiringCheck(cwd)...)
 
