@@ -400,3 +400,21 @@ func TestDoctorDoesNotMistakeMentionForWiring(t *testing.T) {
 		t.Fatalf("упоминание имени программы это не подключение хука:\n%s", out)
 	}
 }
+
+// Отчёт называет сборку, которой выполняется проверка: строка подключения хука
+// содержит абсолютный путь, и по нему не видно, из какой сборки этот файл.
+func TestDoctorNamesTheBuildVersion(t *testing.T) {
+	orig := version
+	t.Cleanup(func() { version = orig })
+	for _, tc := range []struct{ stamped, want string }{
+		{"v1.2.3", "version: v1.2.3"},
+		{"", "version: unknown"}, // без версии — сказано явно, а не пропущено
+	} {
+		version = tc.stamped
+		s := newDoctorStand(t)
+		_, out := s.run(t)
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("версия сборки %q не названа как %q:\n%s", tc.stamped, tc.want, out)
+		}
+	}
+}

@@ -339,3 +339,7 @@ func dispatch(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	}
 	return 0
 }
+
+// version заполняется при сборке (см. Makefile). Значение по умолчанию явное:
+// собранный без версии бинарь тоже надо уметь опознать в отчёте doctor.
+var version = "unknown"

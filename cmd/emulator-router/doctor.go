@@ -81,6 +81,16 @@ func staticChecks(ctx context.Context, cwd string) (config, report) {
 	c := cfg(ctx)
 	var r report
 
+	// Первой строкой и до любого досрочного возврата: проверка отвечает на вопрос
+	// «почему пул ведёт себя не так», и ответом бывает устаревший бинарь по
+	// прежнему пути. Пустая величина приходит из сборки без git, поэтому
+	// отсутствие версии называется явно, а не печатается пустым местом.
+	v := version
+	if v == "" {
+		v = "unknown"
+	}
+	r.add(pass, "version: %s", v)
+
 	for _, tool := range []struct{ name, path string }{
 		{"adb", adb(ctx)},
 		{"emulator", emu(ctx)},
