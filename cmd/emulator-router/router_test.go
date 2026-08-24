@@ -48,7 +48,12 @@ type fake struct {
 	suWorks   bool
 }
 
-func ctxOf(c config) context.Context { return cfgKey.With(context.Background(), c) }
+// ctxOf собирает контекст из настроек и швов: эффект запуска команды едет
+// отдельным ключом, поэтому подставить его в config больше нельзя. Аргумент —
+// сам эффект, а не fake: тестам с настоящими инстансами нужен настоящий запуск.
+func ctxOf(c config, r runner) context.Context {
+	return runKey.With(cfgKey.With(context.Background(), c), r)
+}
 
 func newTestConfig(t *testing.T) (config, *fake) {
 	t.Helper()
@@ -70,7 +75,6 @@ func newTestConfig(t *testing.T) (config, *fake) {
 	c.Registry = t.TempDir()
 	c.COWDir = t.TempDir()
 	c.PortMin, c.PortMax = 15556, 15566
-	c.Run = f.run
 	c.Spawn = func(logPath, name string, args ...string) error {
 		f.logPath = logPath
 		return f.spawn(args)
@@ -333,10 +337,10 @@ func bashJSON(t *testing.T, session, cwd, cmd string) string {
 	return hookJSON(t, "PreToolUse", session, cwd, "Bash", map[string]any{"command": cmd})
 }
 
-func runHook(t *testing.T, c config, input string) (int, string, string) {
+func runHook(t *testing.T, c config, f *fake, input string) (int, string, string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	code := hook(ctxOf(c), strings.NewReader(input), &out, &errOut)
+	code := hook(ctxOf(c, f.run), strings.NewReader(input), &out, &errOut)
 	return code, out.String(), errOut.String()
 }
 
@@ -358,7 +362,7 @@ func seed(t *testing.T, c config, f *fake, port int, e entry) {
 	if e.Image == "" {
 		e.Image = c.AVD // инстанс пула поднят из образа этих настроек
 	}
-	if err := writeEntry(ctxOf(c), port, e); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), port, e); err != nil {
 		t.Fatal(err)
 	}
 	f.devices[port] = "device"
@@ -507,13 +511,13 @@ func TestRegistrySubcommandsWorkWithoutSettings(t *testing.T) {
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: t.TempDir()})
 	var out, errOut bytes.Buffer
 
-	if code := dispatch(ctxOf(c), []string{"status"}, nil, &out, &errOut); code != 0 {
+	if code := dispatch(ctxOf(c, f.run), []string{"status"}, nil, &out, &errOut); code != 0 {
 		t.Fatalf("status: код=%d stderr=%q", code, errOut.String())
 	}
 	if !strings.Contains(out.String(), "emulator-15556") {
 		t.Errorf("status должен показывать занятый инстанс: %q", out.String())
 	}
-	if code := dispatch(ctxOf(c), []string{"reap"}, nil, &out, &errOut); code != 0 {
+	if code := dispatch(ctxOf(c, f.run), []string{"reap"}, nil, &out, &errOut); code != 0 {
 		t.Fatalf("reap: код=%d stderr=%q", code, errOut.String())
 	}
 }
@@ -521,9 +525,9 @@ func TestRegistrySubcommandsWorkWithoutSettings(t *testing.T) {
 // Подкоманду acquire запускают руками и именно для этого каталога, поэтому здесь
 // ненайденный файл — ошибка, а не молчание.
 func TestAcquireSubcommandRequiresSettings(t *testing.T) {
-	c, _ := newTestConfig(t)
+	c, f := newTestConfig(t)
 	var out, errOut bytes.Buffer
-	code := dispatch(ctxOf(c), []string{"acquire", "s1", "0", t.TempDir()}, nil, &out, &errOut)
+	code := dispatch(ctxOf(c, f.run), []string{"acquire", "s1", "0", t.TempDir()}, nil, &out, &errOut)
 	if code != 1 {
 		t.Fatalf("ожидался код 1, получено %d (out=%q)", code, out.String())
 	}
@@ -537,7 +541,7 @@ func TestAcquireSubcommandRequiresSettings(t *testing.T) {
 func TestUnconfiguredProjectIsNotServed(t *testing.T) {
 	c, f := newTestConfig(t)
 	dir := t.TempDir()
-	code, out, errOut := runHook(t, c, bashJSON(t, "s1", dir, "adb install app.apk"))
+	code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", dir, "adb install app.apk"))
 	if code != 0 || out != "" {
 		t.Fatalf("ожидалось молчание, получено код=%d out=%q err=%q", code, out, errOut)
 	}
@@ -554,7 +558,7 @@ func TestBadSettingsBlockTheCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeSettings(t, dir, `{"avd": "img", "typo": 1}`)
-	code, out, errOut := runHook(t, c, bashJSON(t, "s1", dir, "adb install app.apk"))
+	code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", dir, "adb install app.apk"))
 	if code != 2 {
 		t.Fatalf("ожидался код 2, получено %d (out=%q)", code, out)
 	}
@@ -579,11 +583,11 @@ func TestSessionEndReleasesWithoutSettings(t *testing.T) {
 			writeSettings(t, dir, tc.body)
 		}
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: dir})
-		code, _, errOut := runHook(t, c, hookJSON(t, "SessionEnd", "s1", dir, "", nil))
+		code, _, errOut := runHook(t, c, f, hookJSON(t, "SessionEnd", "s1", dir, "", nil))
 		if code != 0 {
 			t.Fatalf("%s: код=%d stderr=%q", tc.name, code, errOut)
 		}
-		if _, err := os.Stat(entryPath(ctxOf(c), 15556)); !os.IsNotExist(err) {
+		if _, err := os.Stat(entryPath(ctxOf(c, f.run), 15556)); !os.IsNotExist(err) {
 			t.Errorf("%s: запись должна быть удалена", tc.name)
 		}
 	}
@@ -598,7 +602,7 @@ func TestMainCheckoutServedWhenConfigured(t *testing.T) {
 	}
 	writeSettings(t, main, `{"avd": "pooled_avd", "mainCheckout": true}`)
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: main})
-	code, out, errOut := runHook(t, c, bashJSON(t, "s1", main, "adb install app.apk"))
+	code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", main, "adb install app.apk"))
 	if code != 0 || out == "" {
 		t.Fatalf("главный чекаут должен обслуживаться: код=%d out=%q err=%q", code, out, errOut)
 	}
@@ -626,7 +630,7 @@ func TestConfiguredReachKeepsCommandPosition(t *testing.T) {
 	for _, tc := range cases {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-		_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, tc.cmd))
+		_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, tc.cmd))
 		if got := out != ""; got != tc.want {
 			t.Errorf("%q: распознано=%v, ожидалось %v (out=%q)", tc.cmd, got, tc.want, out)
 		}
@@ -635,7 +639,7 @@ func TestConfiguredReachKeepsCommandPosition(t *testing.T) {
 
 func TestMainCheckoutNotTouched(t *testing.T) {
 	c, f := newTestConfig(t)
-	code, out, _ := runHook(t, c, bashJSON(t, "s1", mainCheckoutDir(t), "adb install app.apk"))
+	code, out, _ := runHook(t, c, f, bashJSON(t, "s1", mainCheckoutDir(t), "adb install app.apk"))
 	if code != 0 || out != "" {
 		t.Fatalf("в главном чекауте ожидалось молчание, получено код=%d out=%q", code, out)
 	}
@@ -648,18 +652,18 @@ func TestSessionEndReleasesInMainCheckout(t *testing.T) {
 	c, f := newTestConfig(t)
 	main := mainCheckoutDir(t)
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: main})
-	code, _, errOut := runHook(t, c, hookJSON(t, "SessionEnd", "s1", main, "", nil))
+	code, _, errOut := runHook(t, c, f, hookJSON(t, "SessionEnd", "s1", main, "", nil))
 	if code != 0 {
 		t.Fatalf("код=%d stderr=%q", code, errOut)
 	}
-	if _, err := os.Stat(entryPath(ctxOf(c), 15556)); !os.IsNotExist(err) {
+	if _, err := os.Stat(entryPath(ctxOf(c, f.run), 15556)); !os.IsNotExist(err) {
 		t.Fatal("запись должна быть удалена при завершении сессии в главном чекауте")
 	}
 }
 
 func TestSessionEndWithoutInstanceSucceeds(t *testing.T) {
-	c, _ := newTestConfig(t)
-	if code, _, _ := runHook(t, c, hookJSON(t, "SessionEnd", "s1", worktreeDir(t), "", nil)); code != 0 {
+	c, f := newTestConfig(t)
+	if code, _, _ := runHook(t, c, f, hookJSON(t, "SessionEnd", "s1", worktreeDir(t), "", nil)); code != 0 {
 		t.Fatalf("освобождать нечего это успех, получен код %d", code)
 	}
 }
@@ -681,8 +685,8 @@ func TestExitCodes(t *testing.T) {
 		{"чужой инструмент", hookJSON(t, "PreToolUse", "s1", cwd, "Read", nil), 0},
 	}
 	for _, tc := range cases {
-		c, _ := newTestConfig(t)
-		code, out, errOut := runHook(t, c, tc.input)
+		c, f := newTestConfig(t)
+		code, out, errOut := runHook(t, c, f, tc.input)
 		if code != tc.want {
 			t.Errorf("%s: код=%d, ожидался %d (stderr=%q)", tc.name, code, tc.want, errOut)
 		}
@@ -710,7 +714,7 @@ func TestNoInstanceForProbesAndUnrelated(t *testing.T) {
 	}
 	for _, cmd := range quiet {
 		c, f := newTestConfig(t)
-		code, out, errOut := runHook(t, c, bashJSON(t, "s1", cwd, cmd))
+		code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", cwd, cmd))
 		if code != 0 || out != "" {
 			t.Errorf("%q: ожидалось молчание, получено код=%d out=%q err=%q", cmd, code, out, errOut)
 		}
@@ -723,7 +727,7 @@ func TestNoInstanceForProbesAndUnrelated(t *testing.T) {
 func TestMobileMCPListDoesNotAcquire(t *testing.T) {
 	c, f := newTestConfig(t)
 	in := hookJSON(t, "PreToolUse", "s1", worktreeDir(t), "mcp__mobile-mcp__mobile_list_available_devices", nil)
-	code, out, _ := runHook(t, c, in)
+	code, out, _ := runHook(t, c, f, in)
 	if code != 0 || out != "" || len(f.spawns) != 0 {
 		t.Fatalf("перечисление устройств не должно стоить загрузки: код=%d out=%q spawns=%v", code, out, f.spawns)
 	}
@@ -741,7 +745,7 @@ func TestReachRecognition(t *testing.T) {
 	for _, cmd := range reaching {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-		code, out, errOut := runHook(t, c, bashJSON(t, "s1", cwd, cmd))
+		code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", cwd, cmd))
 		if code != 0 || out == "" {
 			t.Errorf("%q: обращение не распознано: код=%d out=%q err=%q", cmd, code, out, errOut)
 		}
@@ -755,7 +759,7 @@ func TestDenyAdbRoot(t *testing.T) {
 	for _, cmd := range []string{"adb root", "adb -s emulator-5556 root", "cd app && adb root"} {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-		code, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, cmd))
+		code, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, cmd))
 		got := decode(t, out)
 		if code != 0 || got.PermissionDecision != "deny" {
 			t.Fatalf("%q: ожидался запрет, получено код=%d %+v", cmd, code, got)
@@ -781,7 +785,7 @@ func TestDenyWritableLaunchOfPooledAVD(t *testing.T) {
 	for _, tc := range cases {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-		_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, tc.cmd))
+		_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, tc.cmd))
 		got := decode(t, out)
 		isDeny := got.PermissionDecision == "deny"
 		if isDeny != tc.deny {
@@ -800,7 +804,7 @@ func TestDenyHappensBeforeAcquire(t *testing.T) {
 	seed(t, c, f, 15556, entry{Session: "other", OwnerPID: 777, CWD: "/elsewhere"})
 	f.starts[777] = "Wed_Aug_20_10:00:00_2026"
 
-	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "adb root"))
+	_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, "adb root"))
 	got := decode(t, out)
 	if !strings.Contains(got.PermissionDecisionReason, "adb root") {
 		t.Fatalf("при исчерпанном пуле причина должна быть о запрете команды, а не об исчерпании: %q", got.PermissionDecisionReason)
@@ -818,12 +822,12 @@ func TestBootingInstanceDeniesWithRetry(t *testing.T) {
 	c.AcquireWait = 20 * time.Second
 	cwd := worktreeDir(t)
 	// Инстанс этой сессии ещё загружается: процесс жив, устройства нет.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: cwd, Image: c.AVD}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", Since: f.now, CWD: cwd, Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
 
-	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "adb install app.apk"))
+	_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, "adb install app.apk"))
 	got := decode(t, out)
 	if got.PermissionDecision != "deny" {
 		t.Fatalf("вызов должен быть запрещён, а не исполнен без привязки: %+v", got)
@@ -831,7 +835,7 @@ func TestBootingInstanceDeniesWithRetry(t *testing.T) {
 	if !strings.Contains(got.PermissionDecisionReason, "retry") || !strings.Contains(got.PermissionDecisionReason, "emulator-15556") {
 		t.Errorf("причина должна называть инстанс и предлагать повторить: %q", got.PermissionDecisionReason)
 	}
-	if _, ok := readEntry(ctxOf(c), 15556); !ok {
+	if _, ok := readEntry(ctxOf(c, f.run), 15556); !ok {
 		t.Error("отказ не должен уносить с собой начатую загрузку")
 	}
 }
@@ -843,7 +847,7 @@ func TestExhaustedPoolDenies(t *testing.T) {
 	seed(t, c, f, 15556, entry{Session: "other", OwnerPID: 777, CWD: "/elsewhere"})
 	f.starts[777] = "Wed_Aug_20_10:00:00_2026"
 
-	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "adb install app.apk"))
+	_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, "adb install app.apk"))
 	got := decode(t, out)
 	if got.PermissionDecision != "deny" {
 		t.Fatalf("невозможность выдать инстанс должна запрещать вызов: %+v", got)
@@ -861,7 +865,7 @@ func TestBashSubstitution(t *testing.T) {
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
 
 	cmd := "cd app && adb -s emulator-9999 install x.apk && adb -e shell ls && adb -s emulator-8888 logcat"
-	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, cmd))
+	_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, cmd))
 	got := decode(t, out)
 	updated, _ := got.UpdatedInput["command"].(string)
 	if len(got.UpdatedInput) != 1 {
@@ -901,7 +905,7 @@ func TestEveryDecisionNamesTheEvent(t *testing.T) {
 	for _, tc := range cases {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-		_, out, _ := runHook(t, c, tc.in(t))
+		_, out, _ := runHook(t, c, f, tc.in(t))
 		if got := decode(t, out).HookEventName; got != "PreToolUse" {
 			t.Errorf("%s: hookEventName=%q, ожидалось PreToolUse", tc.name, got)
 		}
@@ -918,7 +922,7 @@ func TestWrapperGetsNoAppendedArguments(t *testing.T) {
 	writeSettings(t, cwd, `{"avd": "pooled_avd", "reach": ["wrapper\\.sh"]}`)
 	c, f := newTestConfig(t)
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
-	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "./wrapper.sh check"))
+	_, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, "./wrapper.sh check"))
 	updated, _ := decode(t, out).UpdatedInput["command"].(string)
 	if !strings.HasSuffix(updated, "./wrapper.sh check") {
 		t.Errorf("к вызову обёртки не должно дописываться ничего: %q", updated)
@@ -934,7 +938,7 @@ func TestMobileMCPDeviceRewrite(t *testing.T) {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
 		in := hookJSON(t, "PreToolUse", "s1", cwd, "mcp__mobile-mcp__mobile_take_screenshot", ti)
-		_, out, _ := runHook(t, c, in)
+		_, out, _ := runHook(t, c, f, in)
 		if got := decode(t, out).UpdatedInput["device"]; got != "emulator-15556" {
 			t.Errorf("tool_input=%v: device=%q, ожидался emulator-15556", ti, got)
 		}
@@ -958,7 +962,7 @@ func TestMobileMCPKeepsOtherArguments(t *testing.T) {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
 		in := hookJSON(t, "PreToolUse", "s1", cwd, "mcp__mobile-mcp__mobile_click_on_screen_at_coordinates", tc.in)
-		_, out, _ := runHook(t, c, in)
+		_, out, _ := runHook(t, c, f, in)
 		if got := decode(t, out).UpdatedInput; !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("tool_input=%v: решение содержит %v, ожидалось %v", tc.in, got, tc.want)
 		}
@@ -978,7 +982,7 @@ func TestBashKeepsOtherArguments(t *testing.T) {
 		"timeout":           600000.0,
 		"description":       "read the log",
 	})
-	_, out, _ := runHook(t, c, in)
+	_, out, _ := runHook(t, c, f, in)
 	updated := decode(t, out).UpdatedInput
 
 	for k, want := range map[string]any{"run_in_background": true, "timeout": 600000.0, "description": "read the log"} {
@@ -1000,25 +1004,25 @@ func TestAcquireIdempotentAndIsolated(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.starts[100], f.starts[200] = "Wed_10:00:00", "Wed_11:00:00"
 
-	first, err := acquire(ctxOf(c), "s1", 100, "/w1")
+	first, err := acquire(ctxOf(c, f.run), "s1", 100, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := acquire(ctxOf(c), "s1", 100, "/w1")
+	again, err := acquire(ctxOf(c, f.run), "s1", 100, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again != first {
 		t.Errorf("выдача не идемпотентна: %q затем %q", first, again)
 	}
-	sub, err := acquire(ctxOf(c), "subagent-session", 100, "/w1")
+	sub, err := acquire(ctxOf(c, f.run), "subagent-session", 100, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sub != first {
 		t.Errorf("субагент с тем же владельцем должен получить тот же инстанс: %q", sub)
 	}
-	other, err := acquire(ctxOf(c), "s2", 200, "/w2")
+	other, err := acquire(ctxOf(c, f.run), "s2", 200, "/w2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,25 +1041,25 @@ func TestInstanceOfAnotherImageIsNotHandedBack(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.avds = []string{"old_avd", "pooled_avd"}
 	c.AVD = "old_avd"
-	if _, err := acquire(ctxOf(c), "s1", 0, "/w1"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1"); err != nil {
 		t.Fatal(err)
 	}
 
 	c.AVD = "pooled_avd" // в настройках проекта задали другой образ
-	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	serial, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(f.spawns) != 2 {
 		t.Fatalf("инстанс запрошенного образа должен быть запущен: %v", f.spawns)
 	}
-	if ports := entries(ctxOf(c)); len(ports) != 1 {
+	if ports := entries(ctxOf(c, f.run)); len(ports) != 1 {
 		t.Errorf("прежний инстанс должен быть освобождён, в реестре %v", ports)
 	}
 	if serial != "emulator-15556" {
 		t.Errorf("должен возвращаться серийник нового инстанса: %q", serial)
 	}
-	if e, ok := readEntry(ctxOf(c), 15556); !ok || e.Image != "pooled_avd" {
+	if e, ok := readEntry(ctxOf(c, f.run), 15556); !ok || e.Image != "pooled_avd" {
 		t.Errorf("запись должна помнить запрошенный образ: %+v", e)
 	}
 }
@@ -1065,12 +1069,12 @@ func TestInstanceOfAnotherImageIsNotHandedBack(t *testing.T) {
 // держалась бы сессией до конца, ни разу не совпав с настройками.
 func TestEntryWithoutImageIsNotHandedBack(t *testing.T) {
 	c, f := newTestConfig(t)
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
 		t.Fatal(err)
 	}
 	f.devices[15556], f.qemu[15556] = "device", 99999
 
-	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	serial, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,33 +1087,33 @@ func TestAcquireRespectsCap(t *testing.T) {
 	c, f := newTestConfig(t)
 	c.Max = 2
 	f.starts[100], f.starts[200] = "a", "b"
-	if _, err := acquire(ctxOf(c), "s1", 100, "/w1"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s1", 100, "/w1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquire(ctxOf(c), "s2", 200, "/w2"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s2", 200, "/w2"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := acquire(ctxOf(c), "s3", 300, "/w3")
+	_, err := acquire(ctxOf(c, f.run), "s3", 300, "/w3")
 	if err == nil {
 		t.Fatal("ожидалась ошибка исчерпания предела")
 	}
 	if !strings.Contains(err.Error(), "emulator-15556") {
 		t.Errorf("ошибка должна содержать состояние пула: %v", err)
 	}
-	if err := release(ctxOf(c), "s1", 100); err != nil {
+	if err := release(ctxOf(c, f.run), "s1", 100); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquire(ctxOf(c), "s3", 300, "/w3"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s3", 300, "/w3"); err != nil {
 		t.Fatalf("после освобождения инстанс должен выдаваться: %v", err)
 	}
 }
 
 func TestAcquirePicksPortsInStepsOfTwo(t *testing.T) {
 	c, f := newTestConfig(t)
-	if _, err := acquire(ctxOf(c), "s1", 0, "/w1"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquire(ctxOf(c), "s2", 0, "/w2"); err != nil {
+	if _, err := acquire(ctxOf(c, f.run), "s2", 0, "/w2"); err != nil {
 		t.Fatal(err)
 	}
 	want := []int{15556, 15558}
@@ -1121,7 +1125,7 @@ func TestAcquirePicksPortsInStepsOfTwo(t *testing.T) {
 func TestAcquireRequiresPreparedAVD(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.avds = nil
-	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	_, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err == nil || !strings.Contains(err.Error(), "prepare") {
 		t.Fatalf("ожидалась ошибка с указанием подготовить образ, получено %v", err)
 	}
@@ -1134,22 +1138,22 @@ func TestAcquireFailsWhenBootTimesOut(t *testing.T) {
 	c, f := newTestConfig(t)
 	// Инстанс не приходит в готовность: spawn не поднимает устройство.
 	c.Spawn = func(logPath, name string, args ...string) error { f.spawns = append(f.spawns, 0); return nil }
-	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	_, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err == nil || !strings.Contains(err.Error(), "did not boot") {
 		t.Fatalf("ожидалась ошибка загрузки, получено %v", err)
 	}
-	if len(entries(ctxOf(c))) != 0 {
+	if len(entries(ctxOf(c, f.run))) != 0 {
 		t.Error("место должно быть освобождено при неудачной загрузке")
 	}
 }
 
 func TestDeadInstanceEntryIsNotHandedBack(t *testing.T) {
 	c, f := newTestConfig(t)
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	// Записи есть, инстанса нет: устройства и процесса не существует.
-	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	serial, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1164,8 +1168,8 @@ func TestOfflineInstanceWithLiveProcessIsRecovered(t *testing.T) {
 	f.devices[15556] = "offline"
 	// Восстановление: при третьей проверке устройство отвечает.
 	calls := 0
-	adbPath, base := adb(ctxOf(c)), f.run
-	c.Run = func(name string, args ...string) (string, error) {
+	adbPath, base := adb(ctxOf(c, f.run)), f.run
+	stub := func(name string, args ...string) (string, error) {
 		if name == adbPath && len(args) > 0 && args[0] == "devices" {
 			if calls++; calls > 2 {
 				f.devices[15556] = "device"
@@ -1173,7 +1177,7 @@ func TestOfflineInstanceWithLiveProcessIsRecovered(t *testing.T) {
 		}
 		return base(name, args...)
 	}
-	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	serial, err := acquire(ctxOf(c, stub), "s1", 0, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1193,17 +1197,17 @@ func TestOfflineInstanceWithLiveProcessIsRecovered(t *testing.T) {
 func TestBootingInstanceIsNotUtilized(t *testing.T) {
 	c, f := newTestConfig(t)
 	// Запись свежая, процесс инстанса жив, устройства ещё нет: идёт загрузка.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
 	c.AcquireWait = 20 * time.Second // бюджет кончится раньше загрузки
 
-	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	_, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err == nil || !strings.Contains(err.Error(), "retry") {
 		t.Fatalf("ожидался отказ с предложением повторить, получено %v", err)
 	}
-	if _, ok := readEntry(ctxOf(c), 15556); !ok {
+	if _, ok := readEntry(ctxOf(c, f.run), 15556); !ok {
 		t.Error("запись загружающегося инстанса не должна удаляться")
 	}
 	if f.qemu[15556] == 0 {
@@ -1218,14 +1222,14 @@ func TestBootingInstanceIsNotUtilized(t *testing.T) {
 // остаётся загрузкой: её нужно подобрать, а не начать заново.
 func TestBootInProgressIsAdoptedNotRestarted(t *testing.T) {
 	c, f := newTestConfig(t)
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
 	// Устройство появляется много позже, чем отведено на восстановление связи.
 	calls := 0
-	adbPath, base := adb(ctxOf(c)), f.run
-	c.Run = func(name string, args ...string) (string, error) {
+	adbPath, base := adb(ctxOf(c, f.run)), f.run
+	stub := func(name string, args ...string) (string, error) {
 		if name == adbPath && len(args) > 0 && args[0] == "devices" {
 			if calls++; calls > 20 {
 				f.devices[15556] = "device"
@@ -1234,7 +1238,7 @@ func TestBootInProgressIsAdoptedNotRestarted(t *testing.T) {
 		return base(name, args...)
 	}
 
-	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	serial, err := acquire(ctxOf(c, stub), "s1", 0, "/w1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1257,14 +1261,14 @@ func TestReadinessWaitStopsWhenProcessDies(t *testing.T) {
 	}
 	start := f.now
 
-	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	_, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1")
 	if err == nil || !strings.Contains(err.Error(), "did not boot") {
 		t.Fatalf("ожидалась ошибка загрузки, получено %v", err)
 	}
 	if waited := f.now - start; waited >= int64(c.BootTimeout.Seconds()) {
 		t.Errorf("ожидание должно прекращаться при гибели процесса, прошло %d с", waited)
 	}
-	if len(entries(ctxOf(c))) != 0 {
+	if len(entries(ctxOf(c, f.run))) != 0 {
 		t.Error("место должно быть освобождено")
 	}
 }
@@ -1286,7 +1290,7 @@ func TestAcquireDeniesWhenBudgetRunsOut(t *testing.T) {
 	defer func() { syscall.Flock(int(held.Fd()), syscall.LOCK_UN); held.Close() }()
 
 	start := f.now
-	if _, err := acquire(ctxOf(c), "s1", 0, "/w1"); err == nil || !strings.Contains(err.Error(), "retry") {
+	if _, err := acquire(ctxOf(c, f.run), "s1", 0, "/w1"); err == nil || !strings.Contains(err.Error(), "retry") {
 		t.Fatalf("ожидался отказ с предложением повторить, получено %v", err)
 	}
 	if waited := f.now - start; waited > int64(c.AcquireWait.Seconds())+4 {
@@ -1300,12 +1304,12 @@ func TestAcquireDeniesWhenBudgetRunsOut(t *testing.T) {
 func TestReapSparesBootingEntry(t *testing.T) {
 	c, f := newTestConfig(t)
 	// Живой владелец, процесса инстанса ещё нет, запись свежая.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", OwnerPID: 100, OwnerStart: "a", CWD: "/w1", Since: f.now - 10}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", OwnerPID: 100, OwnerStart: "a", CWD: "/w1", Since: f.now - 10}); err != nil {
 		t.Fatal(err)
 	}
 	f.starts[100] = "a"
-	reap(ctxOf(c))
-	if _, err := os.Stat(entryPath(ctxOf(c), 15556)); err != nil {
+	reap(ctxOf(c, f.run))
+	if _, err := os.Stat(entryPath(ctxOf(c, f.run), 15556)); err != nil {
 		t.Fatal("запись загружающегося инстанса не должна убираться")
 	}
 }
@@ -1314,19 +1318,19 @@ func TestReapRemovesOrphans(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.starts[100] = "a"
 	// Живой владелец, инстанс погиб, запись старше времени загрузки.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", OwnerPID: 100, OwnerStart: "a", Since: f.now - 400}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, entry{Session: "s1", OwnerPID: 100, OwnerStart: "a", Since: f.now - 400}); err != nil {
 		t.Fatal(err)
 	}
 	// Мёртвый владелец, запись свежая.
 	f.dead[200] = true
-	if err := writeEntry(ctxOf(c), 15558, entry{Session: "s2", OwnerPID: 200, OwnerStart: "b", Since: f.now}); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15558, entry{Session: "s2", OwnerPID: 200, OwnerStart: "b", Since: f.now}); err != nil {
 		t.Fatal(err)
 	}
 	// Владелец жив, инстанс жив: остаётся.
 	seed(t, c, f, 15560, entry{Session: "s3", OwnerPID: 100, OwnerStart: "a", Since: f.now - 400})
 
-	reap(ctxOf(c))
-	if got := entries(ctxOf(c)); len(got) != 1 || got[0] != 15560 {
+	reap(ctxOf(c, f.run))
+	if got := entries(ctxOf(c, f.run)); len(got) != 1 || got[0] != 15560 {
 		t.Fatalf("после уборки в реестре %v, ожидался только 15560", got)
 	}
 }
@@ -1336,12 +1340,12 @@ func TestReapRemovesOrphans(t *testing.T) {
 // на загрузку отмеряется по времени изменения файла.
 func TestReapRemovesUnreadableEntry(t *testing.T) {
 	c, f := newTestConfig(t)
-	unreadableEntry(t, c, 15556, time.Unix(f.now, 0).Add(-c.BootTimeout-time.Minute))
-	reap(ctxOf(c))
-	if got := entries(ctxOf(c)); len(got) != 0 {
+	unreadableEntry(t, c, f, 15556, time.Unix(f.now, 0).Add(-c.BootTimeout-time.Minute))
+	reap(ctxOf(c, f.run))
+	if got := entries(ctxOf(c, f.run)); len(got) != 0 {
 		t.Fatalf("нечитаемая запись должна убираться, в реестре %v", got)
 	}
-	if !portFree(ctxOf(c), 15556) {
+	if !portFree(ctxOf(c, f.run), 15556) {
 		t.Error("порт нечитаемой записи должен освобождаться")
 	}
 }
@@ -1350,18 +1354,18 @@ func TestReapRemovesUnreadableEntry(t *testing.T) {
 // записи, а не мусор.
 func TestReapSparesJustWrittenUnreadableEntry(t *testing.T) {
 	c, f := newTestConfig(t)
-	unreadableEntry(t, c, 15556, time.Unix(f.now, 0).Add(-10*time.Second))
-	reap(ctxOf(c))
-	if got := entries(ctxOf(c)); len(got) != 1 {
+	unreadableEntry(t, c, f, 15556, time.Unix(f.now, 0).Add(-10*time.Second))
+	reap(ctxOf(c, f.run))
+	if got := entries(ctxOf(c, f.run)); len(got) != 1 {
 		t.Fatalf("свежая нечитаемая запись должна сохраняться, в реестре %v", got)
 	}
 }
 
 // unreadableEntry кладёт в реестр файл, который не удалось бы прочитать: так
 // выглядит запись процесса, умершего до того, как он её дописал.
-func unreadableEntry(t *testing.T, c config, port int, mtime time.Time) {
+func unreadableEntry(t *testing.T, c config, f *fake, port int, mtime time.Time) {
 	t.Helper()
-	path := entryPath(ctxOf(c), port)
+	path := entryPath(ctxOf(c, f.run), port)
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1373,7 +1377,7 @@ func unreadableEntry(t *testing.T, c config, port int, mtime time.Time) {
 func TestReapSparesInstancesOutsideOwnRegistry(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.qemu[15600] = 91234 // инстанс, которого нет в нашем реестре
-	reap(ctxOf(c))
+	reap(ctxOf(c, f.run))
 	if _, ok := f.qemu[15600]; !ok {
 		t.Fatal("уборка не должна завершать инстансы, отсутствующие в собственном реестре")
 	}
@@ -1389,7 +1393,7 @@ func TestReapSweepsUnusedCOWLayers(t *testing.T) {
 		}
 	}
 	f.open[inUse] = true
-	reap(ctxOf(c))
+	reap(ctxOf(c, f.run))
 	if _, err := os.Stat(unused); !os.IsNotExist(err) {
 		t.Error("неиспользуемый слой должен удаляться")
 	}
@@ -1407,7 +1411,7 @@ func TestReapKeepsCOWLayerWhenOccupancyCannotBeChecked(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.noLsof = true
-	reap(ctxOf(c))
+	reap(ctxOf(c, f.run))
 	if _, err := os.Stat(layer); err != nil {
 		t.Error("слой должен сохраняться, когда занятость проверить нечем")
 	}
@@ -1419,10 +1423,10 @@ func TestEntrySurvivesSpacesInPaths(t *testing.T) {
 	c, f := newTestConfig(t)
 	want := entry{Session: "s 1", OwnerPID: 100, OwnerStart: "Wed Aug 20 10:00:00 2026",
 		CWD: "/Users/me/my work/project dir", Since: f.now, Image: "pooled avd"}
-	if err := writeEntry(ctxOf(c), 15556, want); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, want); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := readEntry(ctxOf(c), 15556)
+	got, ok := readEntry(ctxOf(c, f.run), 15556)
 	if !ok || got != want {
 		t.Fatalf("запись прочитана как %+v, ожидалась %+v", got, want)
 	}
@@ -1435,17 +1439,17 @@ func TestEntrySurvivesSpacesInPaths(t *testing.T) {
 func TestEntryIsReplacedWholeOrNotAtAll(t *testing.T) {
 	c, f := newTestConfig(t)
 	first := entry{Session: "s1", OwnerPID: 100, CWD: "/w1", Since: f.now}
-	if err := writeEntry(ctxOf(c), 15556, first); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, first); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := os.Open(entryPath(ctxOf(c), 15556))
+	reader, err := os.Open(entryPath(ctxOf(c, f.run), 15556))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reader.Close()
 
 	second := entry{Session: "s2", OwnerPID: 200, CWD: "/w2", Since: f.now + 1}
-	if err := writeEntry(ctxOf(c), 15556, second); err != nil {
+	if err := writeEntry(ctxOf(c, f.run), 15556, second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1457,7 +1461,7 @@ func TestEntryIsReplacedWholeOrNotAtAll(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil || got != first {
 		t.Errorf("читатель прежней записи увидел %+v (%v), ожидалась %+v", got, err, first)
 	}
-	if got, ok := readEntry(ctxOf(c), 15556); !ok || got != second {
+	if got, ok := readEntry(ctxOf(c, f.run), 15556); !ok || got != second {
 		t.Errorf("по пути записи читается %+v, ожидалась %+v", got, second)
 	}
 }
@@ -1465,10 +1469,10 @@ func TestEntryIsReplacedWholeOrNotAtAll(t *testing.T) {
 func TestOwnerIdentityIncludesStartTime(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.starts[100] = "Wed_Aug_20_11:00:00_2026" // номер переиспользован другим процессом
-	if ownerAlive(ctxOf(c), entry{OwnerPID: 100, OwnerStart: "Wed_Aug_20_10:00:00_2026"}) {
+	if ownerAlive(ctxOf(c, f.run), entry{OwnerPID: 100, OwnerStart: "Wed_Aug_20_10:00:00_2026"}) {
 		t.Error("при ином времени запуска владелец записи должен считаться мёртвым")
 	}
-	if !ownerAlive(ctxOf(c), entry{OwnerPID: 100, OwnerStart: "Wed_Aug_20_11:00:00_2026"}) {
+	if !ownerAlive(ctxOf(c, f.run), entry{OwnerPID: 100, OwnerStart: "Wed_Aug_20_11:00:00_2026"}) {
 		t.Error("владелец с совпадающим временем запуска жив")
 	}
 }
@@ -1480,7 +1484,7 @@ func TestOwnerIsNearestClaudeAncestor(t *testing.T) {
 	f.comm[500] = "-zsh"
 	f.ppid[500] = 600
 	f.comm[600] = "claude"
-	if got := ownerPID(ctxOf(c)); got != 600 {
+	if got := ownerPID(ctxOf(c, f.run)); got != 600 {
 		t.Errorf("владелец определён как %d, ожидался 600", got)
 	}
 }
@@ -1488,7 +1492,7 @@ func TestOwnerIsNearestClaudeAncestor(t *testing.T) {
 func TestOwnerUndefinedWhenNoSessionProcess(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.ppid[os.Getpid()] = 1
-	if got := ownerPID(ctxOf(c)); got != 0 {
+	if got := ownerPID(ctxOf(c, f.run)); got != 0 {
 		t.Errorf("без процесса сессии владелец не определён, получено %d", got)
 	}
 }
@@ -1498,16 +1502,16 @@ func TestOwnerUndefinedWhenNoSessionProcess(t *testing.T) {
 func TestReleaseKillsInstanceAndRemovesLog(t *testing.T) {
 	c, f := newTestConfig(t)
 	seed(t, c, f, 15556, entry{Session: "s1", CWD: "/w1"})
-	if err := os.WriteFile(logPath(ctxOf(c), 15556), []byte("log"), 0o644); err != nil {
+	if err := os.WriteFile(logPath(ctxOf(c, f.run), 15556), []byte("log"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := release(ctxOf(c), "s1", 0); err != nil {
+	if err := release(ctxOf(c, f.run), "s1", 0); err != nil {
 		t.Fatal(err)
 	}
-	if len(entries(ctxOf(c))) != 0 {
+	if len(entries(ctxOf(c, f.run))) != 0 {
 		t.Error("запись должна быть удалена")
 	}
-	if _, err := os.Stat(logPath(ctxOf(c), 15556)); !os.IsNotExist(err) {
+	if _, err := os.Stat(logPath(ctxOf(c, f.run), 15556)); !os.IsNotExist(err) {
 		t.Error("журнал должен быть удалён")
 	}
 	if _, ok := f.qemu[15556]; ok {
@@ -1517,7 +1521,7 @@ func TestReleaseKillsInstanceAndRemovesLog(t *testing.T) {
 
 func TestStatusReportsOwners(t *testing.T) {
 	c, f := newTestConfig(t)
-	if statusText(ctxOf(c)) != "" {
+	if statusText(ctxOf(c, f.run)) != "" {
 		t.Error("состояние пустого пула пусто")
 	}
 	f.starts[100] = "a"
@@ -1525,7 +1529,7 @@ func TestStatusReportsOwners(t *testing.T) {
 	f.dead[200] = true
 	seed(t, c, f, 15558, entry{Session: "s2", OwnerPID: 200, OwnerStart: "b", CWD: "/other"})
 
-	got := statusText(ctxOf(c))
+	got := statusText(ctxOf(c, f.run))
 	for _, want := range []string{"emulator-15556 alive 100 /my work", "emulator-15558 dead 200 /other"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("состояние %q не содержит %q", got, want)
@@ -1540,7 +1544,7 @@ func TestBootRequiresTwoConsecutiveConfirmations(t *testing.T) {
 	replies := []string{"1", "", "1", "1"}
 	calls := 0
 	base := f.run
-	c.Run = func(name string, args ...string) (string, error) {
+	stub := func(name string, args ...string) (string, error) {
 		if len(args) > 3 && args[3] == "getprop" {
 			r := replies[min(calls, len(replies)-1)]
 			calls++
@@ -1552,7 +1556,7 @@ func TestBootRequiresTwoConsecutiveConfirmations(t *testing.T) {
 		return base(name, args...)
 	}
 	since := c.Now()
-	if waitReady(ctxOf(c), 15556, since, since.Add(c.BootTimeout), since.Add(c.AcquireWait)) != bootReady {
+	if waitReady(ctxOf(c, stub), 15556, since, since.Add(c.BootTimeout), since.Add(c.AcquireWait)) != bootReady {
 		t.Fatal("после двух подряд подтверждений ожидалась готовность")
 	}
 	if calls != 4 {
@@ -1566,7 +1570,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	if dir := os.Getenv("LOCK_HOLDER_REGISTRY"); dir != "" {
 		c := defaultConfig()
 		c.Registry = dir
-		if _, err := lock(ctxOf(c), c.Now().Add(c.AcquireWait)); err != nil {
+		if _, err := lock(ctxOf(c, execRun), c.Now().Add(c.AcquireWait)); err != nil {
 			os.Exit(3)
 		}
 		fmt.Println("locked")
@@ -1574,7 +1578,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 		os.Exit(0)
 	}
 
-	c, _ := newTestConfig(t)
+	c, f := newTestConfig(t)
 	c.AcquireWait = 0 // не ждать: держатель жив, блокировка должна быть занята
 	c.Sleep = time.Sleep
 
@@ -1599,7 +1603,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	if !took {
 		t.Fatal("держатель не взял блокировку")
 	}
-	if _, err := lock(ctxOf(c), c.Now()); err == nil {
+	if _, err := lock(ctxOf(c, f.run), c.Now()); err == nil {
 		t.Fatal("пока держатель жив, блокировка должна быть занята")
 	}
 
@@ -1608,7 +1612,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	}
 	holder.Wait()
 
-	lk, err := lock(ctxOf(c), c.Now())
+	lk, err := lock(ctxOf(c, f.run), c.Now())
 	if err != nil {
 		t.Fatalf("после аварийного завершения держателя блокировка должна освободиться: %v", err)
 	}
@@ -1628,15 +1632,15 @@ func TestUnresponsiveInstanceIsForceKilled(t *testing.T) {
 		return nil
 	}
 	// Запрос завершения не помогает: процесс инстанса остаётся.
-	adbPath, base := adb(ctxOf(c)), f.run
-	c.Run = func(name string, args ...string) (string, error) {
+	adbPath, base := adb(ctxOf(c, f.run)), f.run
+	stub := func(name string, args ...string) (string, error) {
 		if name == adbPath && len(args) >= 4 && args[2] == "emu" {
 			return "", nil
 		}
 		return base(name, args...)
 	}
 
-	if err := release(ctxOf(c), "s1", 0); err != nil {
+	if err := release(ctxOf(c, stub), "s1", 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(signals) == 0 || signals[len(signals)-1] != syscall.SIGKILL {

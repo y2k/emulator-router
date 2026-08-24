@@ -56,10 +56,10 @@ type config struct {
 	// без запаса каждый запуск обрывался бы на первой же проверке.
 	ProcessGrace time.Duration
 
-	// ponytail: пять функций вместо перечисленного интерфейса из design.md.
+	// ponytail: четыре функции вместо перечисленного интерфейса из design.md.
 	// Тестируемость даёт шов, а не длина его описания; расширять до интерфейса,
-	// если появится вторая продовая реализация.
-	Run    func(name string, args ...string) (string, error)
+	// если появится вторая продовая реализация. Пятый шов — запуск внешней
+	// команды — уехал отдельным ключом контекста (см. runner).
 	Spawn  func(logPath, name string, args ...string) error
 	Signal func(pid int, sig syscall.Signal) error
 	Now    func() time.Time
@@ -82,7 +82,6 @@ func defaultConfig() config {
 		OfflineTimeout: 30 * time.Second,
 		AcquireWait:    480 * time.Second,
 		ProcessGrace:   15 * time.Second,
-		Run:            run,
 		Spawn:          spawn,
 		Signal:         syscall.Kill,
 		Now:            time.Now,
@@ -245,6 +244,21 @@ var cfgKey = ctxkey.New[config]("config")
 
 func cfg(ctx context.Context) config { return cfgKey.MustGet(ctx) }
 
+// runner — эффект «запустить внешнюю команду». Едет собственным ключом, а не
+// полем настроек: настройки различаются между проектами, а шов во внешний мир —
+// между продом и тестом, и функции, которой нужен только запуск команды,
+// незачем объявлять зависимость от всех настроек сразу.
+type runner func(name string, args ...string) (string, error)
+
+var runKey = ctxkey.New[runner]("run")
+
+// run — хелпер поверх ключа, зеркало cfg. MustGet, а не откат на execRun:
+// забытая подстановка в тесте должна падать с именем ключа, а не запускать
+// настоящие ps и adb на машине разработчика.
+func run(ctx context.Context, name string, args ...string) (string, error) {
+	return runKey.MustGet(ctx)(name, args...)
+}
+
 func adb(ctx context.Context) string {
 	return filepath.Join(cfg(ctx).SDK, "platform-tools", "adb")
 }
@@ -253,7 +267,7 @@ func emu(ctx context.Context) string {
 	return filepath.Join(cfg(ctx).SDK, "emulator", "emulator")
 }
 
-func run(name string, args ...string) (string, error) {
+func execRun(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).Output()
 	return string(out), err
 }
@@ -276,7 +290,8 @@ func spawn(logPath, name string, args ...string) error {
 }
 
 func main() {
-	os.Exit(dispatch(cfgKey.With(context.Background(), defaultConfig()), os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	ctx := runKey.With(cfgKey.With(context.Background(), defaultConfig()), execRun)
+	os.Exit(dispatch(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func dispatch(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {

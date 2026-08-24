@@ -34,7 +34,7 @@ func liveConfig(t *testing.T) config {
 	c.COWDir = t.TempDir()
 	c.PortMin, c.PortMax = 5600, 5610
 	c.Max = 2
-	if !avdExists(ctxOf(c)) {
+	if !avdExists(ctxOf(c, execRun)) {
 		t.Fatalf("образ %q не найден среди доступных: подготовьте его перед прогоном", c.AVD)
 	}
 	return c
@@ -44,7 +44,7 @@ func liveConfig(t *testing.T) config {
 // проверяются на одних и тех же инстансах, потому что каждая загрузка стоит минут.
 func TestLivePoolLifecycle(t *testing.T) {
 	c := liveConfig(t)
-	ctx := ctxOf(c)
+	ctx := ctxOf(c, execRun)
 	t.Cleanup(func() {
 		for _, s := range []string{"live-a", "live-b"} {
 			release(ctx, s, 0)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,9 @@ type doctorStand struct {
 	avdDir string
 	c      config
 	f      *fake
+	// runner — эффект запуска команды, отданный проверке. Отдельным полем, а не
+	// внутри c: тест, которому нужен перехват команды, подменяет его здесь.
+	runner runner
 }
 
 func newDoctorStand(t *testing.T) *doctorStand {
@@ -61,7 +65,7 @@ func newDoctorStand(t *testing.T) *doctorStand {
 	}
 	f.freeKB = 100 * 1024 * 1024 // 100G
 
-	return &doctorStand{cwd: cwd, sdk: sdk, avdDir: avdDir, c: c, f: f}
+	return &doctorStand{cwd: cwd, sdk: sdk, avdDir: avdDir, c: c, f: f, runner: f.run}
 }
 
 // writeAgentSettings кладёт настройки агента (не роутера) в каталог dir.
@@ -77,10 +81,12 @@ func writeAgentSettings(t *testing.T, dir, name, body string) string {
 	return path
 }
 
+func (s *doctorStand) ctx() context.Context { return ctxOf(s.c, s.runner) }
+
 func (s *doctorStand) run(t *testing.T) (int, string) {
 	t.Helper()
 	var out bytes.Buffer
-	code := doctor(ctxOf(s.c), s.cwd, &out)
+	code := doctor(s.ctx(), s.cwd, &out)
 	return code, out.String()
 }
 
@@ -287,7 +293,7 @@ func TestDoctorReleasesProbeInstanceOnFailure(t *testing.T) {
 		if code, out := s.run(t); code == 0 {
 			t.Fatalf("%s: ожидалось нарушение:\n%s", tc.name, out)
 		}
-		if left := entries(ctxOf(s.c)); len(left) != 0 {
+		if left := entries(s.ctx()); len(left) != 0 {
 			t.Errorf("%s: проверочный инстанс не освобождён: %v", tc.name, left)
 		}
 	}
@@ -300,12 +306,12 @@ func TestDoctorProbeEntryIsOwnedByCheckingProcess(t *testing.T) {
 	s := newDoctorStand(t)
 	// Запись существует только между выдачей и освобождением, поэтому снимается
 	// изнутри проверки на запущенном инстансе.
-	inner := s.c.Run
+	inner := s.runner
 	var probe entry
-	s.c.Run = func(name string, args ...string) (string, error) {
+	s.runner = func(name string, args ...string) (string, error) {
 		if len(args) == 4 && args[0] == "-s" && args[2] == "shell" && args[3] == "id" {
-			for _, port := range entries(ctxOf(s.c)) {
-				probe, _ = readEntry(ctxOf(s.c), port)
+			for _, port := range entries(s.ctx()) {
+				probe, _ = readEntry(s.ctx(), port)
 			}
 		}
 		return inner(name, args...)
@@ -317,7 +323,7 @@ func TestDoctorProbeEntryIsOwnedByCheckingProcess(t *testing.T) {
 		t.Fatalf("владелец проверочной записи %d, ожидался процесс проверки %d", probe.OwnerPID, os.Getpid())
 	}
 	s.f.dead[probe.OwnerPID] = true
-	if ownerAlive(ctxOf(s.c), probe) {
+	if ownerAlive(s.ctx(), probe) {
 		t.Error("прерванная проверка должна оставлять запись, собираемую обычной уборкой")
 	}
 }

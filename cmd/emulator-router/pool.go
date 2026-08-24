@@ -127,8 +127,7 @@ func dropEntry(ctx context.Context, port int) {
 // procStart — время запуска процесса. Номер процесса сам по себе не
 // идентификатор: система его переиспользует.
 func procStart(ctx context.Context, pid int) string {
-	c := cfg(ctx)
-	out, err := c.Run("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	out, err := run(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
 	if err != nil {
 		return ""
 	}
@@ -149,8 +148,7 @@ func ownerAlive(ctx context.Context, e entry) bool {
 // deviceState: присутствие в перечислении это не готовность. После перезапуска
 // сервера отладки инстанс десятки секунд значится offline.
 func deviceState(ctx context.Context, port int) string {
-	c := cfg(ctx)
-	out, err := c.Run(adb(ctx), "devices")
+	out, err := run(ctx, adb(ctx), "devices")
 	if err != nil {
 		return ""
 	}
@@ -167,8 +165,7 @@ func deviceState(ctx context.Context, port int) string {
 func serial(port int) string { return "emulator-" + strconv.Itoa(port) }
 
 func qemuPID(ctx context.Context, port int) (int, bool) {
-	c := cfg(ctx)
-	out, err := c.Run("pgrep", "-f", fmt.Sprintf("qemu-system.*-port %d( |$)", port))
+	out, err := run(ctx, "pgrep", "-f", fmt.Sprintf("qemu-system.*-port %d( |$)", port))
 	if err != nil {
 		return 0, false
 	}
@@ -182,7 +179,7 @@ func qemuPID(ctx context.Context, port int) (int, bool) {
 
 func killInstance(ctx context.Context, port int) {
 	c := cfg(ctx)
-	c.Run(adb(ctx), "-s", serial(port), "emu", "kill")
+	run(ctx, adb(ctx), "-s", serial(port), "emu", "kill")
 	if pid, ok := qemuPID(ctx, port); ok {
 		c.Sleep(2 * time.Second)
 		if c.Signal(pid, 0) == nil {
@@ -233,7 +230,7 @@ func reap(ctx context.Context) {
 	layers, _ := filepath.Glob(filepath.Join(c.COWDir, "emulator-*.qcow2"))
 	for _, f := range layers {
 		var notRun *exec.Error
-		if _, err := c.Run("lsof", "-t", f); err != nil && !errors.As(err, &notRun) {
+		if _, err := run(ctx, "lsof", "-t", f); err != nil && !errors.As(err, &notRun) {
 			os.Remove(f)
 		}
 	}
@@ -273,7 +270,7 @@ func mine(ctx context.Context, session string, owner int, deadline time.Time) (i
 		if _, live := qemuPID(ctx, port); live {
 			// Соединение восстанавливается в обоих случаях: свежий инстанс мог
 			// не попасть в перечисление, готовый — выпасть из него.
-			c.Run(adb(ctx), "reconnect", "offline")
+			run(ctx, adb(ctx), "reconnect", "offline")
 			since := time.Unix(e.Since, 0)
 			until := since.Add(c.BootTimeout)
 			if now := c.Now(); now.After(until) {
@@ -295,11 +292,10 @@ func mine(ctx context.Context, session string, owner int, deadline time.Time) (i
 }
 
 func portFree(ctx context.Context, port int) bool {
-	c := cfg(ctx)
 	if _, err := os.Stat(entryPath(ctx, port)); err == nil {
 		return false
 	}
-	if out, err := c.Run(adb(ctx), "devices"); err == nil && strings.Contains(out, serial(port)) {
+	if out, err := run(ctx, adb(ctx), "devices"); err == nil && strings.Contains(out, serial(port)) {
 		return false
 	}
 	l, err := net.Listen("tcp", ":"+strconv.Itoa(port))
@@ -366,7 +362,7 @@ func waitReady(ctx context.Context, port int, since, until, deadline time.Time) 
 			return bootFailed
 		}
 		if deviceState(ctx, port) == "device" {
-			out, err := c.Run(adb(ctx), "-s", serial(port), "shell", "getprop", "sys.boot_completed")
+			out, err := run(ctx, adb(ctx), "-s", serial(port), "shell", "getprop", "sys.boot_completed")
 			if err == nil && strings.TrimSpace(strings.ReplaceAll(out, "\r", "")) == "1" {
 				if streak++; streak >= 2 {
 					return bootReady
@@ -469,7 +465,7 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (string
 
 func avdExists(ctx context.Context) bool {
 	c := cfg(ctx)
-	out, err := c.Run(emu(ctx), "-list-avds")
+	out, err := run(ctx, emu(ctx), "-list-avds")
 	if err != nil {
 		return false
 	}

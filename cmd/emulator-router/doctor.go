@@ -222,7 +222,7 @@ func snapshotChecks(ctx context.Context) report {
 
 	var missing []string
 	for _, img := range baseImages {
-		out, err := c.Run(qemuImg(ctx), "snapshot", "-l", "-U", filepath.Join(avdDir, img))
+		out, err := run(ctx, qemuImg(ctx), "snapshot", "-l", "-U", filepath.Join(avdDir, img))
 		if err != nil || !strings.Contains(out, "default_boot") {
 			missing = append(missing, img)
 		}
@@ -322,7 +322,7 @@ func freeGB(ctx context.Context, path string) (int, error) {
 		}
 		path = parent
 	}
-	out, err := cfg(ctx).Run("df", "-k", path)
+	out, err := run(ctx, "df", "-k", path)
 	if err != nil {
 		return 0, err
 	}
@@ -346,7 +346,6 @@ func freeGB(ctx context.Context, path string) (int, error) {
 // снятый в этом режиме, делает непригодными все клоны) и доступны ли права
 // суперпользователя для отдельной команды.
 func liveChecks(ctx context.Context) report {
-	c := cfg(ctx)
 	var r report
 	session := "doctor-" + strconv.Itoa(os.Getpid())
 
@@ -372,7 +371,7 @@ func liveChecks(ctx context.Context) report {
 		r.add(fail, "instance did not load the snapshot, it cold booted: see %s", logPath(ctx, port))
 	}
 
-	switch out, err := c.Run(adb(ctx), "-s", serial, "shell", "id"); {
+	switch out, err := run(ctx, adb(ctx), "-s", serial, "shell", "id"); {
 	case err != nil:
 		r.add(fail, "cannot read the adb identity on %s: %v", serial, err)
 	case strings.Contains(out, "uid=0"):
@@ -383,7 +382,7 @@ func liveChecks(ctx context.Context) report {
 		r.add(fail, "unexpected adb identity on %s: %q", serial, strings.TrimSpace(out))
 	}
 
-	if out, err := c.Run(adb(ctx), "-s", serial, "shell", "su", "0", "id"); err == nil && strings.Contains(out, "uid=0") {
+	if out, err := run(ctx, adb(ctx), "-s", serial, "shell", "su", "0", "id"); err == nil && strings.Contains(out, "uid=0") {
 		r.add(pass, "root for a single command works")
 	} else {
 		r.add(fail, "'su 0' does not give root on %s: scenarios that need it will fail", serial)

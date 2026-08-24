@@ -211,10 +211,9 @@ func deny(w io.Writer, reason string) int {
 // считается ближайший предок-процесс сессии. Его pid живёт ровно столько, сколько
 // сессия, и субагенты разделяют его, сообщая собственный session_id.
 func ownerPID(ctx context.Context) int {
-	c := cfg(ctx)
 	pid := os.Getpid()
 	for range 8 {
-		out, err := c.Run("ps", "-o", "ppid=", "-p", strconv.Itoa(pid))
+		out, err := run(ctx, "ps", "-o", "ppid=", "-p", strconv.Itoa(pid))
 		if err != nil {
 			return 0
 		}
@@ -223,7 +222,7 @@ func ownerPID(ctx context.Context) int {
 			return 0
 		}
 		pid = p
-		if comm, err := c.Run("ps", "-o", "comm=", "-p", strconv.Itoa(pid)); err == nil && strings.Contains(comm, "claude") {
+		if comm, err := run(ctx, "ps", "-o", "comm=", "-p", strconv.Itoa(pid)); err == nil && strings.Contains(comm, "claude") {
 			return pid
 		}
 	}
