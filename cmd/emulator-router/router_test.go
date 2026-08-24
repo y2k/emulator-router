@@ -1601,7 +1601,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 		}
 	}
 	if !took {
-		t.Fatal("держатель не взял блокировку")
+		t.Fatalf("держатель не взял блокировку: %v", scan.Err())
 	}
 	if _, err := lock(ctxOf(c, f.run), c.Now()); err == nil {
 		t.Fatal("пока держатель жив, блокировка должна быть занята")

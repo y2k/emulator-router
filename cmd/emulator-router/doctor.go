@@ -180,9 +180,9 @@ func wiredIn(path string) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if i := strings.Index(line, "emulator-router"); i >= 0 {
-			if rest := strings.TrimSpace(line[i+len("emulator-router"):]); strings.HasPrefix(rest, "hook") {
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if _, after, ok := strings.Cut(line, "emulator-router"); ok {
+			if rest := strings.TrimSpace(after); strings.HasPrefix(rest, "hook") {
 				return true
 			}
 		}
@@ -265,7 +265,7 @@ func avdHome() string {
 }
 
 func hasLine(content []byte, want string) bool {
-	for _, line := range strings.Split(string(content), "\n") {
+	for line := range strings.SplitSeq(string(content), "\n") {
 		if strings.TrimSpace(line) == want {
 			return true
 		}
@@ -278,7 +278,7 @@ func iniValue(path, key string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		k, v, ok := strings.Cut(line, "=")
 		if ok && strings.TrimSpace(k) == key {
 			return strings.TrimSpace(v)

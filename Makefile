@@ -4,37 +4,54 @@ PKG    := ./cmd/emulator-router
 # Пустая величина (сборка без git) в отчёте называется явно, см. doctor.go.
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null)
 
-.PHONY: all build test emulators vet fmt fmtcheck run clean
+.PHONY: all
+all: vet lint fmtcheck test build
 
-all: vet fmtcheck test build
-
+.PHONY: build
 build:
 	go build -ldflags "-X main.version=$(VERSION)" -o bin/$(BINARY) $(PKG)
 
 # С проверкой гонок: в коде есть взаимное исключение между процессами, ожидание
 # в цикле и порождение процесса с ожиданием в отдельной горутине.
+.PHONY: test
 test:
 	go test -race ./...
 
 # Тесты на настоящих инстансах: занимают слоты в пределе на минуты, поэтому
 # отдельно от обычного прогона. Образ задаётся: make emulators AVD=my_avd
+.PHONY: emulators
 emulators:
 	go test -tags emulators -count=1 -timeout 20m -run TestLive $(PKG) -avd "$(AVD)" -v
 
+.PHONY: vet
 vet:
 	go vet ./...
 
+# Два набора сверх vet: staticcheck — мёртвый код, бесполезные присваивания,
+# устаревшие API; modernize — те же подсказки, что подсвечивает редактор
+# (SplitSeq вместо Split в range, Cut вместо Index, min/max, slices/maps).
+# Версия modernize закреплена по gopls, чтобы make и редактор говорили одно и
+# то же. Инструменты не в go.mod: go run берёт их в кэш модулей.
+.PHONY: lint
+lint:
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+	go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 -test ./...
+
+.PHONY: fmt
 fmt:
 	gofmt -l -w .
 
 # Проверка, а не правка: make fmt чинит файлы молча, поэтому сам по себе он
 # неотформатированный код до основной ветки допускает. Непрерывная сборка
 # запускает make целиком, так что отдельного шага в её описании не нужно.
+.PHONY: fmtcheck
 fmtcheck:
 	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "not gofmt-ed:"; echo "$$out"; exit 1; fi
 
+.PHONY: run
 run:
 	go run $(PKG) $(ARGS)
 
+.PHONY: clean
 clean:
 	rm -rf bin

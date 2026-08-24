@@ -153,7 +153,7 @@ func deviceState(ctx context.Context, port int) string {
 		return ""
 	}
 	want := serial(port)
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 2 && f[0] == want {
 			return f[1]
@@ -169,7 +169,7 @@ func qemuPID(ctx context.Context, port int) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
 			return pid, true
 		}
@@ -469,7 +469,7 @@ func avdExists(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if strings.TrimSpace(line) == c.AVD {
 			return true
 		}
