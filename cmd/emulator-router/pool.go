@@ -30,6 +30,28 @@ var (
 	spaces = regexp.MustCompile(` +`)
 )
 
+// found — исход поиска инстанса сессии. Загружающийся инстанс отличается и от
+// готового, и от отсутствующего: выдать его нельзя, а утилизировать нельзя тем
+// более — это начало бы загрузку заново.
+type found int
+
+const (
+	foundNone found = iota
+	foundReady
+	foundBooting
+)
+
+// boot — исход ожидания готовности. bootPending означает, что раньше готовности
+// кончился бюджет выдачи: инстанс продолжает загружаться, и его подберёт
+// следующее обращение. bootFailed — ждать больше нечего, инстанс утилизируется.
+type boot int
+
+const (
+	bootReady boot = iota
+	bootPending
+	bootFailed
+)
+
 func entryPath(ctx context.Context, port int) string {
 	return filepath.Join(cfg(ctx).Registry, strconv.Itoa(port))
 }
@@ -178,9 +200,15 @@ func reap(ctx context.Context) {
 	}
 }
 
-// mine ищет инстанс сессии или её владельца. wait включает ожидание
-// восстановления временно недоступного инстанса.
-func mine(ctx context.Context, session string, owner int, wait bool) (int, bool) {
+// mine ищет инстанс сессии или её владельца. deadline ограничивает ожидание;
+// нулевое значение означает «не ждать вовсе».
+//
+// Недоступность при живом процессе означает одно из двух, и различает их возраст
+// записи. Запись моложе времени, отведённого на загрузку, — это продолжающаяся
+// загрузка, и ждать её нужно до конца этого времени. Запись старше — инстанс,
+// который был готов и стал недоступен, почти всегда из-за перезапуска сервера
+// отладки; ему отведено время на восстановление, после чего он утилизируется.
+func mine(ctx context.Context, session string, owner int, deadline time.Time) (int, found) {
 	c := cfg(ctx)
 	for _, port := range entries(ctx) {
 		e, ok := readEntry(ctx, port)
@@ -190,29 +218,31 @@ func mine(ctx context.Context, session string, owner int, wait bool) (int, bool)
 		if e.Session != session && !(owner != 0 && e.OwnerPID == owner) {
 			continue
 		}
-		state := deviceState(ctx, port)
-		// Недоступность при живом процессе это почти всегда перезапуск сервера
-		// отладки: инстанс возвращается сам, и утилизация стоила бы сессии
-		// полной загрузки нового.
-		if state != "device" && wait {
-			if _, live := qemuPID(ctx, port); live {
-				c.Run(adb(ctx), "reconnect", "offline")
-				for waited := time.Duration(0); waited < c.OfflineTimeout && state != "device"; waited += 2 * time.Second {
-					c.Sleep(2 * time.Second)
-					state = deviceState(ctx, port)
-				}
+		if deviceState(ctx, port) == "device" {
+			return port, foundReady
+		}
+		if _, live := qemuPID(ctx, port); live {
+			// Соединение восстанавливается в обоих случаях: свежий инстанс мог
+			// не попасть в перечисление, готовый — выпасть из него.
+			c.Run(adb(ctx), "reconnect", "offline")
+			since := time.Unix(e.Since, 0)
+			until := since.Add(c.BootTimeout)
+			if now := c.Now(); now.After(until) {
+				until = now.Add(c.OfflineTimeout)
+			}
+			switch waitReady(ctx, port, since, until, deadline) {
+			case bootReady:
+				return port, foundReady
+			case bootPending:
+				return port, foundBooting
 			}
 		}
 		// Запись переживает свой инстанс при аварии процесса или закрытии окна;
 		// выдача такого серийника привязала бы сессию к мёртвому устройству.
-		if state != "device" {
-			killInstance(ctx, port)
-			dropEntry(ctx, port)
-			continue
-		}
-		return port, true
+		killInstance(ctx, port)
+		dropEntry(ctx, port)
 	}
-	return 0, false
+	return 0, foundNone
 }
 
 func portFree(ctx context.Context, port int) bool {
@@ -234,8 +264,9 @@ func portFree(ctx context.Context, port int) bool {
 // lock сериализует запуски между процессами: одновременный старт двух инстансов
 // ломает загрузку из снапшота. flock, а не каталог-лок: ядро снимает блокировку
 // при завершении процесса любым способом, поэтому «пул заклинен навсегда»
-// недостижимо.
-func lock(ctx context.Context) (*os.File, error) {
+// недостижимо. Своего предела у ожидания блокировки нет: он складывался бы с
+// остальными, поэтому ожидание ограничено общим бюджетом выдачи.
+func lock(ctx context.Context, deadline time.Time) (*os.File, error) {
 	c := cfg(ctx)
 	if err := os.MkdirAll(c.Registry, 0o755); err != nil {
 		return nil, err
@@ -244,13 +275,13 @@ func lock(ctx context.Context) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	for waited := time.Duration(0); ; waited += 2 * time.Second {
+	for {
 		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
 			return f, nil
 		}
-		if waited > c.LockTimeout {
+		if !c.Now().Before(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("another acquire holds the launch lock")
+			return nil, fmt.Errorf("another session is launching an instance, retry in a moment")
 		}
 		c.Sleep(2 * time.Second)
 	}
@@ -261,24 +292,50 @@ func unlock(f *os.File) {
 	f.Close()
 }
 
-// waitBoot: загруженный это ещё не пригодный. Пока свежий клон регистрируется в
-// сервере отладки, обращения к любому инстансу могут не выполняться, поэтому
-// готовностью считаются два последовательных подтверждения.
-func waitBoot(ctx context.Context, port int) bool {
+// waitReady ждёт готовности инстанса. Загруженный это ещё не пригодный: пока
+// свежий клон регистрируется в сервере отладки, обращения к любому инстансу могут
+// не выполняться, поэтому готовностью считаются присутствие в перечислении и два
+// последовательных подтверждения загрузки.
+//
+// Пределов два, и различает их именно исход. until — конец времени, отведённого
+// на само ожидание: за ним инстанс подлежит утилизации. deadline — конец бюджета
+// выдачи: за ним инстанс остаётся жить, а обращение отказывается с предложением
+// повторить. since — момент, с которого инстанс существует; он нужен, чтобы
+// отсутствие процесса в первые секунды не считалось гибелью.
+func waitReady(ctx context.Context, port int, since, until, deadline time.Time) boot {
 	c := cfg(ctx)
 	streak := 0
-	for waited := time.Duration(0); waited < c.BootTimeout; waited += 3 * time.Second {
-		out, err := c.Run(adb(ctx), "-s", serial(port), "shell", "getprop", "sys.boot_completed")
-		if err == nil && strings.TrimSpace(strings.ReplaceAll(out, "\r", "")) == "1" {
-			if streak++; streak >= 2 {
-				return true
+	for {
+		if now := c.Now(); now.After(until) {
+			return bootFailed
+		} else if now.After(deadline) {
+			return bootPending
+		} else if _, live := qemuPID(ctx, port); !live && now.Sub(since) > c.ProcessGrace {
+			// Процесса нет, и запас на его появление истёк: дальнейшее ожидание
+			// заведомо безрезультатно, а до его конца погибший инстанс держит
+			// взаимное исключение запусков и расходует время остальных сессий.
+			return bootFailed
+		}
+		if deviceState(ctx, port) == "device" {
+			out, err := c.Run(adb(ctx), "-s", serial(port), "shell", "getprop", "sys.boot_completed")
+			if err == nil && strings.TrimSpace(strings.ReplaceAll(out, "\r", "")) == "1" {
+				if streak++; streak >= 2 {
+					return bootReady
+				}
+			} else {
+				streak = 0
 			}
 		} else {
 			streak = 0
 		}
 		c.Sleep(3 * time.Second)
 	}
-	return false
+}
+
+// bootingErr: отказ, а не молчаливое ожидание. Причина обязана говорить, что
+// делать, иначе повторный вызов придёт немедленно и получит то же самое.
+func bootingErr(port int) error {
+	return fmt.Errorf("instance %s is still booting, retry in a moment", serial(port))
 }
 
 func acquire(ctx context.Context, session string, owner int, cwd string) (string, error) {
@@ -289,10 +346,17 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (string
 	if err := os.MkdirAll(c.Registry, 0o755); err != nil {
 		return "", err
 	}
+	// Крайний срок вычисляется один раз на всю выдачу: складываются именно
+	// ожидания внутри неё, поэтому отдельные пределы у каждого из них проблему не
+	// решают.
+	deadline := c.Now().Add(c.AcquireWait)
 	reap(ctx)
 
-	if port, ok := mine(ctx, session, owner, true); ok {
+	switch port, st := mine(ctx, session, owner, deadline); st {
+	case foundReady:
 		return serial(port), nil
+	case foundBooting:
+		return "", bootingErr(port)
 	}
 
 	if !avdExists(ctx) {
@@ -300,7 +364,7 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (string
 	}
 
 	// Блокировка держится сквозь всю загрузку намеренно.
-	lk, err := lock(ctx)
+	lk, err := lock(ctx, deadline)
 	if err != nil {
 		return "", err
 	}
@@ -338,13 +402,19 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (string
 		return "", err
 	}
 
-	if !waitBoot(ctx, port) {
-		killInstance(ctx, port)
-		dropEntry(ctx, port)
-		return "", fmt.Errorf("instance on port %d did not boot in %s, see %s",
-			port, c.BootTimeout, logPath(ctx, port))
+	since := c.Now()
+	switch waitReady(ctx, port, since, since.Add(c.BootTimeout), deadline) {
+	case bootReady:
+		return serial(port), nil
+	case bootPending:
+		// Загрузку прерывать нельзя: следующее обращение начало бы её заново, и
+		// при повторяющихся обращениях пул не пришёл бы в рабочее состояние.
+		return "", bootingErr(port)
 	}
-	return serial(port), nil
+	killInstance(ctx, port)
+	dropEntry(ctx, port)
+	return "", fmt.Errorf("instance on port %d did not boot in %s, see %s",
+		port, c.BootTimeout, logPath(ctx, port))
 }
 
 func avdExists(ctx context.Context) bool {
@@ -361,9 +431,11 @@ func avdExists(ctx context.Context) bool {
 	return false
 }
 
+// release завершает инстанс сессии, в том числе ещё загружающийся: сессии,
+// которая его заказала, больше нет, и доводить загрузку до конца незачем.
 func release(ctx context.Context, session string, owner int) error {
-	port, ok := mine(ctx, session, owner, false)
-	if !ok {
+	port, st := mine(ctx, session, owner, time.Time{})
+	if st == foundNone {
 		return nil // освобождать нечего это успех
 	}
 	killInstance(ctx, port)

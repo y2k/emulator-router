@@ -44,7 +44,17 @@ type config struct {
 	PortMax           int
 	BootTimeout       time.Duration
 	OfflineTimeout    time.Duration
-	LockTimeout       time.Duration
+	// AcquireWait — предел на всю выдачу целиком, а не на каждое ожидание внутри
+	// неё: складываются именно они. Заведомо меньше 600 секунд — предела, который
+	// вызывающая сторона отводит команде хука по умолчанию, — потому что
+	// прерванная по этому пределу обработка вызов не блокирует: он исполняется
+	// без привязки и уходит на произвольное устройство. Не настройка проекта:
+	// пределы времени различаются между реализациями, а не между проектами.
+	AcquireWait time.Duration
+	// ProcessGrace — запас, в течение которого отсутствие процесса инстанса не
+	// считается его гибелью. Программа эмулятора запускает qemu не мгновенно, и
+	// без запаса каждый запуск обрывался бы на первой же проверке.
+	ProcessGrace time.Duration
 
 	// ponytail: пять функций вместо перечисленного интерфейса из design.md.
 	// Тестируемость даёт шов, а не длина его описания; расширять до интерфейса,
@@ -70,7 +80,8 @@ func defaultConfig() config {
 		PortMax:        5682,
 		BootTimeout:    300 * time.Second,
 		OfflineTimeout: 30 * time.Second,
-		LockTimeout:    360 * time.Second,
+		AcquireWait:    480 * time.Second,
+		ProcessGrace:   15 * time.Second,
 		Run:            run,
 		Spawn:          spawn,
 		Signal:         syscall.Kill,

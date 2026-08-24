@@ -26,17 +26,23 @@ absolute path printed by `go env GOPATH` plus `/bin/emulator-router`:
     "PreToolUse": [
       {
         "matcher": "Bash|mcp__mobile-mcp__.*",
-        "hooks": [{ "type": "command", "command": "/Users/you/go/bin/emulator-router hook" }]
+        "hooks": [{ "type": "command", "command": "/Users/you/go/bin/emulator-router hook", "timeout": 540 }]
       }
     ],
     "SessionEnd": [
       {
-        "hooks": [{ "type": "command", "command": "/Users/you/go/bin/emulator-router hook" }]
+        "hooks": [{ "type": "command", "command": "/Users/you/go/bin/emulator-router hook", "timeout": 540 }]
       }
     ]
   }
 }
 ```
+
+The `timeout` is set on purpose. Handing out an instance can wait for another
+session's launch and then for a boot, and the router gives up and denies the call
+before its own budget runs out. A hook killed by the timeout does *not* block the
+call — it would run unrouted, on whatever device came first — so the timeout is
+kept above that budget rather than left at the default.
 
 ## Configure
 

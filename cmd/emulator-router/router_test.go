@@ -78,7 +78,9 @@ func newTestConfig(t *testing.T) (config, *fake) {
 		return nil
 	}
 	c.Now = func() time.Time { return time.Unix(f.now, 0) }
-	c.Sleep = func(time.Duration) {}
+	// Сон не тратит настоящего времени, но двигает часы: пределы выдачи заданы
+	// сроками, и без движения часов срок не наступал бы никогда.
+	c.Sleep = func(d time.Duration) { f.now += int64(d.Seconds()) }
 	return c, f
 }
 
@@ -798,6 +800,32 @@ func TestDenyHappensBeforeAcquire(t *testing.T) {
 	}
 }
 
+// Отказ на время загрузки идёт тем же путём, что и остальные отказы выдачи:
+// прибитая по внешнему пределу обработка вызов не блокирует, поэтому решение
+// обязано быть явным.
+func TestBootingInstanceDeniesWithRetry(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.AcquireWait = 20 * time.Second
+	cwd := worktreeDir(t)
+	// Инстанс этой сессии ещё загружается: процесс жив, устройства нет.
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: cwd}); err != nil {
+		t.Fatal(err)
+	}
+	f.qemu[15556] = 99999
+
+	_, out, _ := runHook(t, c, bashJSON(t, "s1", cwd, "adb install app.apk"))
+	got := decode(t, out)
+	if got.PermissionDecision != "deny" {
+		t.Fatalf("вызов должен быть запрещён, а не исполнен без привязки: %+v", got)
+	}
+	if !strings.Contains(got.PermissionDecisionReason, "retry") || !strings.Contains(got.PermissionDecisionReason, "emulator-15556") {
+		t.Errorf("причина должна называть инстанс и предлагать повторить: %q", got.PermissionDecisionReason)
+	}
+	if _, ok := readEntry(ctxOf(c), 15556); !ok {
+		t.Error("отказ не должен уносить с собой начатую загрузку")
+	}
+}
+
 func TestExhaustedPoolDenies(t *testing.T) {
 	c, f := newTestConfig(t)
 	c.Max = 1
@@ -1100,6 +1128,116 @@ func TestOfflineInstanceWithLiveProcessIsRecovered(t *testing.T) {
 
 // --- уборка ---
 
+// Загрузка, начатую предыдущим обращением, повторное обращение не должно
+// утилизировать: иначе каждый повтор начинает её заново и пул не приходит в
+// рабочее состояние никогда.
+func TestBootingInstanceIsNotUtilized(t *testing.T) {
+	c, f := newTestConfig(t)
+	// Запись свежая, процесс инстанса жив, устройства ещё нет: идёт загрузка.
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.qemu[15556] = 99999
+	c.AcquireWait = 20 * time.Second // бюджет кончится раньше загрузки
+
+	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	if err == nil || !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("ожидался отказ с предложением повторить, получено %v", err)
+	}
+	if _, ok := readEntry(ctxOf(c), 15556); !ok {
+		t.Error("запись загружающегося инстанса не должна удаляться")
+	}
+	if f.qemu[15556] == 0 {
+		t.Error("процесс загружающегося инстанса не должен завершаться")
+	}
+	if len(f.spawns) != 0 {
+		t.Errorf("второй инстанс запускать нельзя: %v", f.spawns)
+	}
+}
+
+// Загрузка, не уложившаяся во время, отведённое на восстановление, всё равно
+// остаётся загрузкой: её нужно подобрать, а не начать заново.
+func TestBootInProgressIsAdoptedNotRestarted(t *testing.T) {
+	c, f := newTestConfig(t)
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.qemu[15556] = 99999
+	// Устройство появляется много позже, чем отведено на восстановление связи.
+	calls := 0
+	adbPath, base := adb(ctxOf(c)), f.run
+	c.Run = func(name string, args ...string) (string, error) {
+		if name == adbPath && len(args) > 0 && args[0] == "devices" {
+			if calls++; calls > 20 {
+				f.devices[15556] = "device"
+			}
+		}
+		return base(name, args...)
+	}
+
+	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serial != "emulator-15556" {
+		t.Errorf("должен возвращаться загрузившийся инстанс: %q", serial)
+	}
+	if len(f.spawns) != 0 {
+		t.Errorf("начатая загрузка подбирается, а не начинается заново: %v", f.spawns)
+	}
+}
+
+// Погибший при запуске инстанс не должен держать взаимное исключение запусков
+// всё время, отведённое загрузке: этим временем оплачивают ожидание остальные.
+func TestReadinessWaitStopsWhenProcessDies(t *testing.T) {
+	c, f := newTestConfig(t)
+	// Запуск не поднимает ни устройства, ни процесса.
+	c.Spawn = func(logPath, name string, args ...string) error {
+		f.spawns = append(f.spawns, 0)
+		return nil
+	}
+	start := f.now
+
+	_, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	if err == nil || !strings.Contains(err.Error(), "did not boot") {
+		t.Fatalf("ожидалась ошибка загрузки, получено %v", err)
+	}
+	if waited := f.now - start; waited >= int64(c.BootTimeout.Seconds()) {
+		t.Errorf("ожидание должно прекращаться при гибели процесса, прошло %d с", waited)
+	}
+	if len(entries(ctxOf(c))) != 0 {
+		t.Error("место должно быть освобождено")
+	}
+}
+
+// Бюджет выдачи меньше предела, отведённого вызывающей стороной: за её пределом
+// обработку прерывают, а прерванная обработка вызов не блокирует.
+func TestAcquireDeniesWhenBudgetRunsOut(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.AcquireWait = 10 * time.Second
+
+	// Взаимное исключение запусков держит кто-то другой.
+	held, err := os.OpenFile(filepath.Join(c.Registry, ".launch.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { syscall.Flock(int(held.Fd()), syscall.LOCK_UN); held.Close() }()
+
+	start := f.now
+	if _, err := acquire(ctxOf(c), "s1", 0, "/w1"); err == nil || !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("ожидался отказ с предложением повторить, получено %v", err)
+	}
+	if waited := f.now - start; waited > int64(c.AcquireWait.Seconds())+4 {
+		t.Errorf("ожидание не должно выходить за бюджет выдачи, прошло %d с", waited)
+	}
+	if len(f.spawns) != 0 {
+		t.Errorf("инстанс запускать было нельзя: %v", f.spawns)
+	}
+}
+
 func TestReapSparesBootingEntry(t *testing.T) {
 	c, f := newTestConfig(t)
 	// Живой владелец, процесса инстанса ещё нет, запись свежая.
@@ -1249,10 +1387,12 @@ func TestStatusReportsOwners(t *testing.T) {
 }
 
 func TestBootRequiresTwoConsecutiveConfirmations(t *testing.T) {
-	c, _ := newTestConfig(t)
+	c, f := newTestConfig(t)
+	f.devices[15556], f.qemu[15556] = "device", 99999
 	// Загруженный это ещё не пригодный: одно подтверждение готовностью не является.
 	replies := []string{"1", "", "1", "1"}
 	calls := 0
+	base := f.run
 	c.Run = func(name string, args ...string) (string, error) {
 		if len(args) > 3 && args[3] == "getprop" {
 			r := replies[min(calls, len(replies)-1)]
@@ -1262,9 +1402,10 @@ func TestBootRequiresTwoConsecutiveConfirmations(t *testing.T) {
 			}
 			return r + "\r\n", nil
 		}
-		return "", errors.New("unexpected call: " + name)
+		return base(name, args...)
 	}
-	if !waitBoot(ctxOf(c), 15556) {
+	since := c.Now()
+	if waitReady(ctxOf(c), 15556, since, since.Add(c.BootTimeout), since.Add(c.AcquireWait)) != bootReady {
 		t.Fatal("после двух подряд подтверждений ожидалась готовность")
 	}
 	if calls != 4 {
@@ -1278,7 +1419,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	if dir := os.Getenv("LOCK_HOLDER_REGISTRY"); dir != "" {
 		c := defaultConfig()
 		c.Registry = dir
-		if _, err := lock(ctxOf(c)); err != nil {
+		if _, err := lock(ctxOf(c), c.Now().Add(c.AcquireWait)); err != nil {
 			os.Exit(3)
 		}
 		fmt.Println("locked")
@@ -1287,7 +1428,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	}
 
 	c, _ := newTestConfig(t)
-	c.LockTimeout = 0 // не ждать: держатель жив, блокировка должна быть занята
+	c.AcquireWait = 0 // не ждать: держатель жив, блокировка должна быть занята
 	c.Sleep = time.Sleep
 
 	holder := exec.Command(os.Args[0], "-test.run=TestLaunchLockSurvivesKilledHolder")
@@ -1311,7 +1452,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	if !took {
 		t.Fatal("держатель не взял блокировку")
 	}
-	if _, err := lock(ctxOf(c)); err == nil {
+	if _, err := lock(ctxOf(c), c.Now()); err == nil {
 		t.Fatal("пока держатель жив, блокировка должна быть занята")
 	}
 
@@ -1320,7 +1461,7 @@ func TestLaunchLockSurvivesKilledHolder(t *testing.T) {
 	}
 	holder.Wait()
 
-	lk, err := lock(ctxOf(c))
+	lk, err := lock(ctxOf(c), c.Now())
 	if err != nil {
 		t.Fatalf("после аварийного завершения держателя блокировка должна освободиться: %v", err)
 	}
