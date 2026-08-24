@@ -340,16 +340,18 @@ func liveChecks(ctx context.Context) report {
 	var r report
 	session := "doctor-" + strconv.Itoa(os.Getpid())
 
-	// Владелец не определён намеренно: проверочная запись не должна переживать
-	// эту команду, а освобождение идёт тем же путём, что у обычной сессии.
-	serial, err := acquire(ctx, session, 0, ".")
+	// Владелец — сам процесс проверки: запись с неопределённым владельцем
+	// считается принадлежащей живой сессии, и уборка не забирает её никогда, так
+	// что прерванная проверка держала бы место в пределе до ручной чистки.
+	owner := os.Getpid()
+	serial, err := acquire(ctx, session, owner, ".")
 	if err != nil {
 		r.add(fail, "acquire failed: %v", err)
 		return r
 	}
 	// Освобождение при любом исходе, включая нарушение: иначе doctor в сломанном
 	// окружении сам занимал бы место в пределе.
-	defer release(ctx, session, 0)
+	defer release(ctx, session, owner)
 	r.add(pass, "acquire works: %s", serial)
 
 	port, _ := strconv.Atoi(strings.TrimPrefix(serial, "emulator-"))

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -91,7 +93,26 @@ func writeEntry(ctx context.Context, port int, e entry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(entryPath(ctx, port), b, 0o644)
+	// Запись появляется в реестре целиком: перезапись на месте проходит через
+	// усечённое состояние, а усечённая запись неотличима от нечитаемой — держит
+	// порт и место в пределе, а сессии не достаётся. Временный файл лежит в том
+	// же каталоге, иначе замена не была бы переименованием.
+	tmp, err := os.CreateTemp(c.Registry, strconv.Itoa(port)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), entryPath(ctx, port))
 }
 
 func dropEntry(ctx context.Context, port int) {
@@ -166,8 +187,8 @@ func killInstance(ctx context.Context, port int) {
 	}
 }
 
-// reap убирает три вида мусора: записи с мёртвым владельцем, записи с живым
-// владельцем и погибшим инстансом, неиспользуемые COW-слои.
+// reap убирает четыре вида мусора: записи с мёртвым владельцем, записи с живым
+// владельцем и погибшим инстансом, нечитаемые записи, неиспользуемые COW-слои.
 //
 // Инстансы, отсутствующие в собственном реестре, не трогаются вовсе: bash-версия
 // прибивала все read-only процессы эмулятора на машине, спецификация это запрещает.
@@ -176,6 +197,14 @@ func reap(ctx context.Context) {
 	for _, port := range entries(ctx) {
 		e, ok := readEntry(ctx, port)
 		if !ok {
+			// Нечитаемую запись не может использовать ни одна сессия, а место в
+			// пределе и порт она держит, поэтому пропуск оставлял бы пул меньше
+			// навсегда. Запас отмеряется по времени изменения файла: времени
+			// создания у неё нет, а писать её могли прямо сейчас. Инстанс не
+			// завершается: чей он, сказать нечем.
+			if fi, err := os.Stat(entryPath(ctx, port)); err == nil && c.Now().Sub(fi.ModTime()) > c.BootTimeout {
+				dropEntry(ctx, port)
+			}
 			continue
 		}
 		if ownerAlive(ctx, e) {
@@ -192,9 +221,15 @@ func reap(ctx context.Context) {
 		dropEntry(ctx, port)
 	}
 	// При принудительном завершении qemu не удаляет свой слой сам.
+	//
+	// Слой сохраняется не только занятым, но и тогда, когда занятость проверить
+	// нечем: отсутствие ответа — не ответ «свободен». Не запустившаяся команда
+	// отличается от ответившей типом ошибки: у первой это *exec.Error, у второй —
+	// код возврата.
 	layers, _ := filepath.Glob(filepath.Join(c.COWDir, "emulator-*.qcow2"))
 	for _, f := range layers {
-		if _, err := c.Run("lsof", "-t", f); err != nil {
+		var notRun *exec.Error
+		if _, err := c.Run("lsof", "-t", f); err != nil && !errors.As(err, &notRun) {
 			os.Remove(f)
 		}
 	}

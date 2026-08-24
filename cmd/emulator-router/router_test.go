@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,8 +32,11 @@ type fake struct {
 	starts  map[int]string
 	dead    map[int]bool
 	open    map[string]bool
-	spawns  []int
-	now     int64
+	// noLsof — средства проверки занятости в системе нет: команда не запускается
+	// вовсе, а не отвечает «никем не открыт».
+	noLsof bool
+	spawns []int
+	now    int64
 
 	// Для doctor: снапшоты в базовых образах, свободное место, лог загрузки
 	// инстанса, идентичность демона отладки и доступность прав суперпользователя.
@@ -131,6 +135,9 @@ func (f *fake) run(name string, args ...string) (string, error) {
 	case "pgrep":
 		return f.pgrep(args)
 	case "lsof":
+		if f.noLsof {
+			return "", &exec.Error{Name: "lsof", Err: exec.ErrNotFound}
+		}
 		if len(args) == 2 && args[0] == "-t" {
 			if f.open[args[1]] {
 				return "1234\n", nil
@@ -1272,6 +1279,45 @@ func TestReapRemovesOrphans(t *testing.T) {
 	}
 }
 
+// Нечитаемая запись перестаёт быть бессмертной: использовать её не может никто,
+// а место в пределе и порт она держит. Времени создания у неё нет, поэтому запас
+// на загрузку отмеряется по времени изменения файла.
+func TestReapRemovesUnreadableEntry(t *testing.T) {
+	c, f := newTestConfig(t)
+	unreadableEntry(t, c, 15556, time.Unix(f.now, 0).Add(-c.BootTimeout-time.Minute))
+	reap(ctxOf(c))
+	if got := entries(ctxOf(c)); len(got) != 0 {
+		t.Fatalf("нечитаемая запись должна убираться, в реестре %v", got)
+	}
+	if !portFree(ctxOf(c), 15556) {
+		t.Error("порт нечитаемой записи должен освобождаться")
+	}
+}
+
+// Запись могли создавать прямо сейчас: свежая нечитаемая запись — это половина
+// записи, а не мусор.
+func TestReapSparesJustWrittenUnreadableEntry(t *testing.T) {
+	c, f := newTestConfig(t)
+	unreadableEntry(t, c, 15556, time.Unix(f.now, 0).Add(-10*time.Second))
+	reap(ctxOf(c))
+	if got := entries(ctxOf(c)); len(got) != 1 {
+		t.Fatalf("свежая нечитаемая запись должна сохраняться, в реестре %v", got)
+	}
+}
+
+// unreadableEntry кладёт в реестр файл, который не удалось бы прочитать: так
+// выглядит запись процесса, умершего до того, как он её дописал.
+func unreadableEntry(t *testing.T, c config, port int, mtime time.Time) {
+	t.Helper()
+	path := entryPath(ctxOf(c), port)
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReapSparesInstancesOutsideOwnRegistry(t *testing.T) {
 	c, f := newTestConfig(t)
 	f.qemu[15600] = 91234 // инстанс, которого нет в нашем реестре
@@ -1300,6 +1346,21 @@ func TestReapSweepsUnusedCOWLayers(t *testing.T) {
 	}
 }
 
+// Отсутствие ответа о занятости — не ответ «свободен»: когда проверять нечем,
+// слой сохраняется.
+func TestReapKeepsCOWLayerWhenOccupancyCannotBeChecked(t *testing.T) {
+	c, f := newTestConfig(t)
+	layer := filepath.Join(c.COWDir, "emulator-15556.qcow2")
+	if err := os.WriteFile(layer, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.noLsof = true
+	reap(ctxOf(c))
+	if _, err := os.Stat(layer); err != nil {
+		t.Error("слой должен сохраняться, когда занятость проверить нечем")
+	}
+}
+
 // --- реестр и владелец ---
 
 func TestEntrySurvivesSpacesInPaths(t *testing.T) {
@@ -1312,6 +1373,40 @@ func TestEntrySurvivesSpacesInPaths(t *testing.T) {
 	got, ok := readEntry(ctxOf(c), 15556)
 	if !ok || got != want {
 		t.Fatalf("запись прочитана как %+v, ожидалась %+v", got, want)
+	}
+}
+
+// Читатель, открывший файл записи до перезаписи, обязан увидеть прежнюю запись
+// целиком. Перезапись на месте проходит через усечённое состояние, в котором
+// запись неотличима от нечитаемой: она держит порт и место в пределе, а сессии
+// не достаётся. Замена файла целиком показать это состояние не может.
+func TestEntryIsReplacedWholeOrNotAtAll(t *testing.T) {
+	c, f := newTestConfig(t)
+	first := entry{Session: "s1", OwnerPID: 100, CWD: "/w1", Since: f.now}
+	if err := writeEntry(ctxOf(c), 15556, first); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := os.Open(entryPath(ctxOf(c), 15556))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	second := entry{Session: "s2", OwnerPID: 200, CWD: "/w2", Since: f.now + 1}
+	if err := writeEntry(ctxOf(c), 15556, second); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got entry
+	if err := json.Unmarshal(b, &got); err != nil || got != first {
+		t.Errorf("читатель прежней записи увидел %+v (%v), ожидалась %+v", got, err, first)
+	}
+	if got, ok := readEntry(ctxOf(c), 15556); !ok || got != second {
+		t.Errorf("по пути записи читается %+v, ожидалась %+v", got, second)
 	}
 }
 

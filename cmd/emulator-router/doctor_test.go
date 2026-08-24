@@ -293,6 +293,35 @@ func TestDoctorReleasesProbeInstanceOnFailure(t *testing.T) {
 	}
 }
 
+// Проверочная запись принадлежит процессу проверки: запись с неопределённым
+// владельцем считается принадлежащей живой сессии, и уборка не забирает её
+// никогда — прерванная проверка занимала бы место в пределе до ручной чистки.
+func TestDoctorProbeEntryIsOwnedByCheckingProcess(t *testing.T) {
+	s := newDoctorStand(t)
+	// Запись существует только между выдачей и освобождением, поэтому снимается
+	// изнутри проверки на запущенном инстансе.
+	inner := s.c.Run
+	var probe entry
+	s.c.Run = func(name string, args ...string) (string, error) {
+		if len(args) == 4 && args[0] == "-s" && args[2] == "shell" && args[3] == "id" {
+			for _, port := range entries(ctxOf(s.c)) {
+				probe, _ = readEntry(ctxOf(s.c), port)
+			}
+		}
+		return inner(name, args...)
+	}
+	if code, out := s.run(t); code != 0 {
+		t.Fatalf("код=%d, ожидался 0\n%s", code, out)
+	}
+	if probe.OwnerPID != os.Getpid() {
+		t.Fatalf("владелец проверочной записи %d, ожидался процесс проверки %d", probe.OwnerPID, os.Getpid())
+	}
+	s.f.dead[probe.OwnerPID] = true
+	if ownerAlive(ctxOf(s.c), probe) {
+		t.Error("прерванная проверка должна оставлять запись, собираемую обычной уборкой")
+	}
+}
+
 // Вторая половина молчаливого отказа: настройки роутера есть, а вызывать его
 // некому. От исправной работы это неотличимо ничем — все остальные проверки,
 // включая запуск настоящего инстанса, проходят.
