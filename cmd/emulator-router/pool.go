@@ -25,6 +25,10 @@ type entry struct {
 	OwnerStart string `json:"owner_start"`
 	CWD        string `json:"cwd"`
 	Since      int64  `json:"since"`
+	// Image — образ, из которого инстанс поднят. Реестр один на машину, а образ
+	// приходит из настроек проекта, поэтому без него инстанс прежнего образа
+	// выдавался бы как свой после обновления образа в настройках.
+	Image string `json:"image"`
 }
 
 var (
@@ -253,6 +257,16 @@ func mine(ctx context.Context, session string, owner int, deadline time.Time) (i
 		if e.Session != session && !(owner != 0 && e.OwnerPID == owner) {
 			continue
 		}
+		// Инстанс другого образа не свой: сессия просила один образ, а работала бы
+		// с другим молча. Освобождение, а не отказ: сессии нужен рабочий инстанс,
+		// и выдача тут же поднимет инстанс запрошенного образа. Освобождение при
+		// этом от образа не зависит — оно приходит с настройками по умолчанию, где
+		// образа нет, и попадает в эту же ветвь.
+		if e.Image != c.AVD {
+			killInstance(ctx, port)
+			dropEntry(ctx, port)
+			continue
+		}
 		if deviceState(ctx, port) == "device" {
 			return port, foundReady
 		}
@@ -427,6 +441,7 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (string
 		OwnerStart: procStart(ctx, owner),
 		CWD:        cwd,
 		Since:      c.Now().Unix(),
+		Image:      c.AVD,
 	}); err != nil {
 		return "", err
 	}

@@ -355,6 +355,9 @@ func seed(t *testing.T, c config, f *fake, port int, e entry) {
 	if e.Since == 0 {
 		e.Since = f.now
 	}
+	if e.Image == "" {
+		e.Image = c.AVD // инстанс пула поднят из образа этих настроек
+	}
 	if err := writeEntry(ctxOf(c), port, e); err != nil {
 		t.Fatal(err)
 	}
@@ -815,7 +818,7 @@ func TestBootingInstanceDeniesWithRetry(t *testing.T) {
 	c.AcquireWait = 20 * time.Second
 	cwd := worktreeDir(t)
 	// Инстанс этой сессии ещё загружается: процесс жив, устройства нет.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: cwd}); err != nil {
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: cwd, Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
@@ -1027,6 +1030,55 @@ func TestAcquireIdempotentAndIsolated(t *testing.T) {
 	}
 }
 
+// Своим считается только инстанс запрошенного образа. Иначе смена образа в
+// настройках проекта оставляет сессию работать с прежним образом молча: серийник
+// тот же, устройство отвечает, и отличить это от исправной работы нечем.
+func TestInstanceOfAnotherImageIsNotHandedBack(t *testing.T) {
+	c, f := newTestConfig(t)
+	f.avds = []string{"old_avd", "pooled_avd"}
+	c.AVD = "old_avd"
+	if _, err := acquire(ctxOf(c), "s1", 0, "/w1"); err != nil {
+		t.Fatal(err)
+	}
+
+	c.AVD = "pooled_avd" // в настройках проекта задали другой образ
+	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.spawns) != 2 {
+		t.Fatalf("инстанс запрошенного образа должен быть запущен: %v", f.spawns)
+	}
+	if ports := entries(ctxOf(c)); len(ports) != 1 {
+		t.Errorf("прежний инстанс должен быть освобождён, в реестре %v", ports)
+	}
+	if serial != "emulator-15556" {
+		t.Errorf("должен возвращаться серийник нового инстанса: %q", serial)
+	}
+	if e, ok := readEntry(ctxOf(c), 15556); !ok || e.Image != "pooled_avd" {
+		t.Errorf("запись должна помнить запрошенный образ: %+v", e)
+	}
+}
+
+// Записи, сделанные до того, как образ стал записываться, его не содержат:
+// образ неизвестен, значит это инстанс другого образа. Иначе такая запись
+// держалась бы сессией до конца, ни разу не совпав с настройками.
+func TestEntryWithoutImageIsNotHandedBack(t *testing.T) {
+	c, f := newTestConfig(t)
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+		t.Fatal(err)
+	}
+	f.devices[15556], f.qemu[15556] = "device", 99999
+
+	serial, err := acquire(ctxOf(c), "s1", 0, "/w1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serial != "emulator-15556" || len(f.spawns) != 1 {
+		t.Errorf("запись без образа должна быть освобождена и заменена запуском: %q %v", serial, f.spawns)
+	}
+}
+
 func TestAcquireRespectsCap(t *testing.T) {
 	c, f := newTestConfig(t)
 	c.Max = 2
@@ -1093,7 +1145,7 @@ func TestAcquireFailsWhenBootTimesOut(t *testing.T) {
 
 func TestDeadInstanceEntryIsNotHandedBack(t *testing.T) {
 	c, f := newTestConfig(t)
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	// Записи есть, инстанса нет: устройства и процесса не существует.
@@ -1141,7 +1193,7 @@ func TestOfflineInstanceWithLiveProcessIsRecovered(t *testing.T) {
 func TestBootingInstanceIsNotUtilized(t *testing.T) {
 	c, f := newTestConfig(t)
 	// Запись свежая, процесс инстанса жив, устройства ещё нет: идёт загрузка.
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
@@ -1166,7 +1218,7 @@ func TestBootingInstanceIsNotUtilized(t *testing.T) {
 // остаётся загрузкой: её нужно подобрать, а не начать заново.
 func TestBootInProgressIsAdoptedNotRestarted(t *testing.T) {
 	c, f := newTestConfig(t)
-	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1"}); err != nil {
+	if err := writeEntry(ctxOf(c), 15556, entry{Session: "s1", Since: f.now, CWD: "/w1", Image: c.AVD}); err != nil {
 		t.Fatal(err)
 	}
 	f.qemu[15556] = 99999
@@ -1366,7 +1418,7 @@ func TestReapKeepsCOWLayerWhenOccupancyCannotBeChecked(t *testing.T) {
 func TestEntrySurvivesSpacesInPaths(t *testing.T) {
 	c, f := newTestConfig(t)
 	want := entry{Session: "s 1", OwnerPID: 100, OwnerStart: "Wed Aug 20 10:00:00 2026",
-		CWD: "/Users/me/my work/project dir", Since: f.now}
+		CWD: "/Users/me/my work/project dir", Since: f.now, Image: "pooled avd"}
 	if err := writeEntry(ctxOf(c), 15556, want); err != nil {
 		t.Fatal(err)
 	}
