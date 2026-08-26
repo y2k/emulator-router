@@ -359,6 +359,11 @@ func seed(t *testing.T, c config, f *fake, port int, e entry) {
 	if e.Since == 0 {
 		e.Since = f.now
 	}
+	// Готовый инстанс принадлежит работающей сессии: без отметки он был бы записью
+	// полувекового простоя. Тесты уборки по простою задают LastSeen сами.
+	if e.LastSeen == 0 {
+		e.LastSeen = f.now
+	}
 	if e.Image == "" {
 		e.Image = c.AVD // инстанс пула поднят из образа этих настроек
 	}
@@ -475,6 +480,7 @@ func TestSettingsRejectBadFiles(t *testing.T) {
 		// делают файл негодным наравне с опечаткой в имени поля.
 		{"задан предел инстансов", `{"avd": "img", "max": 3}`, "max"},
 		{"задан ускоритель графики", `{"avd": "img", "gpu": "host"}`, "gpu"},
+		{"задан предел простоя", `{"avd": "img", "idleTimeout": 300}`, "idleTimeout"},
 	}
 	for _, tc := range cases {
 		path := writeSettings(t, t.TempDir(), tc.body)
@@ -558,22 +564,29 @@ func TestUnconfiguredProjectIsNotServed(t *testing.T) {
 }
 
 // Найденный файл означает сознательную настройку: продолжать на дефолтах нельзя.
+// Пределы времени настройками проекта не являются, поэтому заданный предел
+// простоя блокирует вызов наравне с опечаткой в имени поля.
 func TestBadSettingsBlockTheCall(t *testing.T) {
-	c, f := newTestConfig(t)
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	writeSettings(t, dir, `{"avd": "img", "typo": 1}`)
-	code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", dir, "adb install app.apk"))
-	if code != 2 {
-		t.Fatalf("ожидался код 2, получено %d (out=%q)", code, out)
-	}
-	if !strings.Contains(errOut, "typo") {
-		t.Errorf("причина должна называть поле: %q", errOut)
-	}
-	if len(f.spawns) != 0 {
-		t.Fatalf("инстанс не должен запускаться: %v", f.spawns)
+	for _, tc := range []struct{ name, body, want string }{
+		{"незнакомое поле", `{"avd": "img", "typo": 1}`, "typo"},
+		{"задан предел простоя", `{"avd": "img", "idleTimeout": 300}`, "idleTimeout"},
+	} {
+		c, f := newTestConfig(t)
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeSettings(t, dir, tc.body)
+		code, out, errOut := runHook(t, c, f, bashJSON(t, "s1", dir, "adb install app.apk"))
+		if code != 2 {
+			t.Fatalf("%s: ожидался код 2, получено %d (out=%q)", tc.name, code, out)
+		}
+		if !strings.Contains(errOut, tc.want) {
+			t.Errorf("%s: причина должна называть поле: %q", tc.name, errOut)
+		}
+		if len(f.spawns) != 0 {
+			t.Fatalf("%s: инстанс не должен запускаться: %v", tc.name, f.spawns)
+		}
 	}
 }
 
@@ -1537,7 +1550,7 @@ func TestStatusReportsOwners(t *testing.T) {
 	seed(t, c, f, 15558, entry{Session: "s2", OwnerPID: 200, OwnerStart: "b", CWD: "/other"})
 
 	got := statusText(ctxOf(c, f.run))
-	for _, want := range []string{"emulator-15556 alive 100 /my work", "emulator-15558 dead 200 /other"} {
+	for _, want := range []string{"emulator-15556 alive 100 idle=0s /my work", "emulator-15558 dead 200 idle=0s /other"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("состояние %q не содержит %q", got, want)
 		}
@@ -1652,5 +1665,325 @@ func TestUnresponsiveInstanceIsForceKilled(t *testing.T) {
 	}
 	if len(signals) == 0 || signals[len(signals)-1] != syscall.SIGKILL {
 		t.Errorf("неответивший инстанс должен завершаться принудительно, сигналы: %v", signals)
+	}
+}
+
+// --- простой ---
+
+// routerLog — содержимое журнала решений.
+func routerLog(t *testing.T, c config) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(c.Registry, "router.log"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Запись без отметки — либо запись прежней версии, либо запись, о работе чьей
+// сессии свидетельств нет. Простой у неё бесконечный, и уходит она первой.
+func TestEntryWithoutLastSeenIsIdleForever(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	if err := os.WriteFile(entryPath(ctx, 15556), []byte(`{"session":"s1","since":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := readEntry(ctx, 15556)
+	if !ok {
+		t.Fatal("запись прежней версии должна читаться")
+	}
+	if got := idle(ctx, e); got <= c.IdleTimeout {
+		t.Errorf("простой записи без отметки %s, ожидался больше %s", got, c.IdleTimeout)
+	}
+}
+
+func TestTouchMarksOwnEntryOnly(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	seed(t, c, f, 15556, entry{Session: "s1"})
+	seed(t, c, f, 15558, entry{Session: "s2"})
+	was := f.now
+	f.now += 100
+
+	touch(ctx, "s1")
+	if e, _ := readEntry(ctx, 15556); e.LastSeen != f.now {
+		t.Errorf("своя запись не отмечена: %d, ожидалось %d", e.LastSeen, f.now)
+	}
+	if e, _ := readEntry(ctx, 15558); e.LastSeen != was {
+		t.Errorf("чужая запись отмечена: %d, ожидалось %d", e.LastSeen, was)
+	}
+
+	// Сессия без инстанса записи не создаёт.
+	touch(ctx, "s3")
+	if got := entries(ctx); len(got) != 2 {
+		t.Errorf("в реестре %v, ожидались только две прежние записи", got)
+	}
+}
+
+// Брошенную сессию не отличить от работающей ни по владельцу, ни по процессу
+// инстанса: живы оба. Отличает только простой.
+func TestSweepIdleRemovesAbandonedSession(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	f.starts[100] = "a"
+	seed(t, c, f, 15556, entry{Session: "s1", OwnerPID: 100, OwnerStart: "a", Since: f.now - 1000, LastSeen: f.now - 1000})
+	seed(t, c, f, 15558, entry{Session: "s2", OwnerPID: 100, OwnerStart: "a", Since: f.now - 1000, LastSeen: f.now - 10})
+
+	sweepIdle(ctx)
+
+	if got := entries(ctx); len(got) != 1 || got[0] != 15558 {
+		t.Fatalf("после уборки в реестре %v, ожидался только 15558", got)
+	}
+	if _, live := f.qemu[15556]; live {
+		t.Error("инстанс простаивающей сессии должен быть завершён")
+	}
+	if got := routerLog(t, c); !strings.Contains(got, "emulator-15556 kill reason=idle idle=16m40s session=s1") {
+		t.Errorf("журнал не называет инстанс, простой и причину: %q", got)
+	}
+}
+
+// Сирота с неизвестным владельцем: живой её считает всякая проверка владельца,
+// поэтому остальные виды уборки не могут тронуть её в принципе.
+func TestSweepIdleRemovesEntryWithoutLastSeen(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	if err := writeEntry(ctx, 15556, entry{Session: "s1", Since: f.now - 1000, Image: c.AVD}); err != nil {
+		t.Fatal(err)
+	}
+	f.devices[15556], f.qemu[15556] = "device", 99999
+
+	sweepIdle(ctx)
+
+	if got := entries(ctx); len(got) != 0 {
+		t.Fatalf("в реестре %v, ожидалась пустота", got)
+	}
+	// Полвека в журнале выглядели бы переполнением, а не причиной.
+	if got := routerLog(t, c); !strings.Contains(got, "kill reason=idle idle=never session=s1") {
+		t.Errorf("журнал %q должен называть простой записи без отметки как never", got)
+	}
+}
+
+// Запись создаётся до запуска, а загрузка событий хука не порождает: свежая
+// запись это не простой, а запуск, который может быть ещё не завершён.
+func TestSweepIdleSparesBootingEntry(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	if err := writeEntry(ctx, 15556, entry{Session: "s1", Since: f.now - 10, Image: c.AVD}); err != nil {
+		t.Fatal(err)
+	}
+	sweepIdle(ctx)
+	if got := entries(ctx); len(got) != 1 {
+		t.Fatalf("запись загружающегося инстанса убрана: %v", got)
+	}
+}
+
+// Проход по простою выполняется на каждом вызове инструмента в любом проекте
+// машины, поэтому в обычном случае он обязан не делать ничего.
+func TestSweepIdleRunsNoCommandsWhenNothingIsStale(t *testing.T) {
+	c, f := newTestConfig(t)
+	calls := 0
+	counting := func(name string, args ...string) (string, error) {
+		calls++
+		return f.run(name, args...)
+	}
+	ctx := ctxOf(c, counting)
+	seed(t, c, f, 15556, entry{Session: "s1", Since: f.now - 1000, LastSeen: f.now - 10})
+
+	sweepIdle(ctx)
+
+	if calls != 0 {
+		t.Errorf("проход запустил %d внешних команд, ожидалось ни одной", calls)
+	}
+	if got := entries(ctx); len(got) != 1 {
+		t.Fatalf("в реестре %v, ожидалась одна запись", got)
+	}
+}
+
+// Ожидание готовности это активность: событий хука сессия в это время не
+// порождает, а ждать может дольше, чем отведено простою. Без отметки внутри
+// ожидания инстанс завершила бы уборка из чужого процесса — прямо под тем
+// обращением, которое его ждёт.
+func TestWaitingForReadinessCountsAsActivity(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.IdleTimeout = 60 * time.Second
+	start := f.now
+	// Запись старше времени загрузки: запас на незавершённый запуск её не
+	// защищает, защищает только отметка.
+	ctx := ctxOf(c, f.run)
+	if err := writeEntry(ctx, 15556, entry{Session: "s1", Since: start - 1000, LastSeen: start, Image: c.AVD}); err != nil {
+		t.Fatal(err)
+	}
+	f.qemu[15556] = 99999
+	f.devices[15556] = "offline"
+	// Готовность наступает позже, чем отведено простою.
+	base := f.run
+	stub := func(name string, args ...string) (string, error) {
+		if f.now-start > 120 {
+			f.devices[15556] = "device"
+		}
+		return base(name, args...)
+	}
+	ctx = ctxOf(c, stub)
+
+	since := time.Unix(start, 0)
+	if got := waitReady(ctx, 15556, since, since.Add(c.BootTimeout), since.Add(c.AcquireWait)); got != bootReady {
+		t.Fatalf("ожидалась готовность, получено %v", got)
+	}
+	e, _ := readEntry(ctx, 15556)
+	if got := idle(ctx, e); got > c.IdleTimeout {
+		t.Errorf("простой ожидавшей сессии %s, ожидалось не больше %s", got, c.IdleTimeout)
+	}
+	sweepIdle(ctx)
+	if got := entries(ctx); len(got) != 1 {
+		t.Fatalf("запись, готовности которой ждали, убрана: %v", got)
+	}
+}
+
+func TestAcquireMarksActivity(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	seed(t, c, f, 15556, entry{Session: "s1", CWD: "/w"})
+	f.now += 100
+
+	if _, err := acquire(ctx, "s1", 0, "/w"); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := readEntry(ctx, 15556); e.LastSeen != f.now {
+		t.Errorf("повторная выдача не отметила запись: %d, ожидалось %d", e.LastSeen, f.now)
+	}
+}
+
+// Место, которое держала брошенная сессия, достаётся новой.
+func TestIdleEntryFreesSlotForNewSession(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.Max = 1
+	ctx := ctxOf(c, f.run)
+	f.starts[100] = "a"
+	seed(t, c, f, 15556, entry{Session: "old", OwnerPID: 100, OwnerStart: "a", Since: f.now - 1000, LastSeen: f.now - 1000})
+
+	got, err := acquire(ctx, "new", 0, "/w")
+	if err != nil {
+		t.Fatalf("выдача не состоялась: %v", err)
+	}
+	if len(f.spawns) != 1 {
+		t.Fatalf("запусков %v, ожидался один", f.spawns)
+	}
+	ports := entries(ctx)
+	if len(ports) != 1 {
+		t.Fatalf("в реестре %v, ожидалась одна запись", ports)
+	}
+	if e, _ := readEntry(ctx, ports[0]); e.Session != "new" {
+		t.Errorf("место досталось сессии %q, ожидалась new (выдан %s)", e.Session, got)
+	}
+}
+
+// Хук приходит из любого проекта, поэтому за брошенной сессией подметает любая
+// живая: сама брошенная событий уже не порождает.
+func TestHookSweepsIdleRegardlessOfSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantCode int
+	}{
+		{"файла настроек нет", "", 0},
+		{"файл настроек негоден", `{"avd": "img", "typo": 1}`, 2},
+	} {
+		c, f := newTestConfig(t)
+		ctx := ctxOf(c, f.run)
+		dir := t.TempDir()
+		if tc.body != "" {
+			if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeSettings(t, dir, tc.body)
+		}
+		f.starts[100] = "a"
+		seed(t, c, f, 15556, entry{Session: "old", OwnerPID: 100, OwnerStart: "a", Since: f.now - 1000, LastSeen: f.now - 1000})
+
+		code, out, _ := runHook(t, c, f, bashJSON(t, "s2", dir, "adb install app.apk"))
+
+		if code != tc.wantCode {
+			t.Errorf("%s: код=%d, ожидался %d (out=%q)", tc.name, code, tc.wantCode, out)
+		}
+		if tc.wantCode == 0 && out != "" {
+			t.Errorf("%s: непричастный проект должен молчать: %q", tc.name, out)
+		}
+		if got := entries(ctx); len(got) != 0 {
+			t.Errorf("%s: простаивающая запись не убрана: %v", tc.name, got)
+		}
+	}
+}
+
+// Работа сессии это работа, даже когда до устройства она не дотягивается:
+// читающая проверка и запрещённая команда отмечают активность наравне с выдачей.
+func TestEventsThatServeNoInstanceStillMarkActivity(t *testing.T) {
+	for _, tc := range []struct{ name, cmd string }{
+		{"читающая проверка", "adb devices"},
+		{"запрещённая команда", "adb root"},
+		{"нераспознанная команда", "git status"},
+	} {
+		c, f := newTestConfig(t)
+		ctx := ctxOf(c, f.run)
+		dir := worktreeDir(t)
+		seed(t, c, f, 15556, entry{Session: "s1", CWD: dir})
+		f.now += 100
+
+		if code, _, errOut := runHook(t, c, f, bashJSON(t, "s1", dir, tc.cmd)); code != 0 {
+			t.Fatalf("%s: код=%d stderr=%q", tc.name, code, errOut)
+		}
+		if e, _ := readEntry(ctx, 15556); e.LastSeen != f.now {
+			t.Errorf("%s: активность не отмечена: %d, ожидалось %d", tc.name, e.LastSeen, f.now)
+		}
+		if len(f.spawns) != 0 {
+			t.Errorf("%s: инстанс не должен запускаться: %v", tc.name, f.spawns)
+		}
+	}
+}
+
+// --- журнал решений ---
+
+func TestLogRecordsLaunchAndDenial(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.Max = 1
+	ctx := ctxOf(c, f.run)
+	// Время запуска берётся до выдачи: ожидание готовности двигает часы.
+	stamp := time.Unix(f.now, 0).Format(time.RFC3339)
+
+	if _, err := acquire(ctx, "s1", 0, "/w"); err != nil {
+		t.Fatal(err)
+	}
+	// Предел исчерпан: вторая сессия получает отказ.
+	if _, err := acquire(ctx, "s2", 0, "/w2"); err == nil {
+		t.Fatal("ожидался отказ по пределу")
+	}
+
+	got := routerLog(t, c)
+	for _, want := range []string{
+		stamp + " emulator-15556 launch session=s1 image=pooled_avd cwd=/w",
+		"- deny session=s2 reason=all 1 instances are busy; ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("журнал %q не содержит %q", got, want)
+		}
+	}
+}
+
+// Журнал это наблюдение за пулом, а не условие его работы.
+func TestUnwritableLogDoesNotChangeOutcome(t *testing.T) {
+	c, f := newTestConfig(t)
+	ctx := ctxOf(c, f.run)
+	if err := os.Mkdir(filepath.Join(c.Registry, "router.log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, c, f, 15556, entry{Session: "s1", CWD: "/w"})
+
+	if err := release(ctx, "s1", 0); err != nil {
+		t.Fatalf("освобождение должно пройти и без журнала: %v", err)
+	}
+	if got := entries(ctx); len(got) != 0 {
+		t.Errorf("в реестре %v, ожидалась пустота", got)
 	}
 }

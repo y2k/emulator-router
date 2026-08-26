@@ -119,7 +119,7 @@ from.
 | `doctor [cwd]` | checks the preconditions the pool depends on |
 | `release <session> [owner]` | frees the session's instance |
 | `reap` | clears orphaned registry entries and copy-on-write layers |
-| `status` | prints held instances, owner liveness, and owner working directory |
+| `status` | prints held instances, owner liveness, idle time, and owner working directory |
 
 `hook` exit codes: `0` — success, decision (if any) on stdout; `2` — blocking
 error, reason on stderr; `1` — release failure on `SessionEnd`, where there is
@@ -183,6 +183,25 @@ process dies, so "the pool is wedged forever" is unreachable.
 
 Reaping only ever touches instances present in this registry — emulators you
 started yourself are left alone.
+
+Every handled hook event stamps the calling session's entry and sweeps entries
+whose session has been inactive for five minutes: that instance is killed and its
+slot returns to the pool. Inactivity means no hook event at all, not just no
+device call, and waiting for an instance to boot counts as activity. This is the
+one form of reaping that takes a working instance away from a live owner — a
+session that comes back gets a fresh instance, and the state of the old one is
+gone. Any live session sweeps for all of them, since an abandoned session no
+longer produces events of its own.
+
+Decisions that change what the pool holds — launch, denial, kill and its reason —
+are appended to `~/.claude/emulator-router/router.log`, one line each. That is
+the only way to observe the idle sweep: it happens in another session's process.
+
+```
+2026-08-25T18:42:03+03:00 emulator-5556 kill reason=idle idle=3h12m0s session=7749ff01
+2026-08-25T18:42:09+03:00 emulator-5556 launch session=fab3610b image=agent_base cwd=/home/you/project
+2026-08-25T18:47:31+03:00 - deny session=a91c02f4 reason=all 3 instances are busy; ...
+```
 
 ## Specs
 
