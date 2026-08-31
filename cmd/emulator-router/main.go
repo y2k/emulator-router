@@ -349,12 +349,48 @@ func dispatch(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		reap(ctx)
 	case "status":
 		fmt.Fprint(stdout, statusText(ctx))
+	case "help", "--help", "-h":
+		fmt.Fprint(stdout, helpText)
 	default:
-		fmt.Fprintln(stderr, "usage: emulator-router {hook|acquire <session> [owner] [cwd]|release <session> [owner]|doctor [cwd]|reap|status}")
+		// Не сама справка: экран текста в потоке ошибок делает ошибочный вызов
+		// похожим на успешный и прячет собственно ошибку.
+		fmt.Fprintf(stderr, "unknown subcommand %q; try: emulator-router --help\n", cmd)
 		return 1
 	}
 	return 0
 }
+
+// helpText — справка по подкомандам. Живёт в бинаре, а не только в README:
+// установленный через `go install` бинарь лежит вне репозитория проекта, а
+// README — внутри. Перечень подкоманд обязан быть полным (закреплено тестом
+// TestHelpNamesEverySubcommand), поэтому строка запроса справки называет и саму
+// себя. Настройки не описываются, а адресуются: переносить README в бинарь
+// незачем.
+const helpText = `emulator-router - a pool of Android emulators, one instance per Claude Code session
+
+usage: emulator-router [subcommand] [args]
+
+  hook                              handle a hook event on stdin: PreToolUse and SessionEnd
+  acquire <session> [owner] [cwd]   hand out an instance and print its serial
+  release <session> [owner]         free the session's instance
+  doctor [cwd]                      check the preconditions the pool depends on
+  reap                              clear orphaned registry entries and copy-on-write layers
+  status                            print held instances, owner liveness, idle time and working directory
+  help, --help, -h                  print this help
+
+With no subcommand at all, status runs.
+
+acquire and doctor are run by hand for one directory, so they need the project
+settings file .claude/emulator-router.json found above it and fail without one.
+The other subcommands do not: hook stays silent in an unconfigured project, and
+status and reap only ever touch the registry.
+
+hook exit codes: 0 - success, decision (if any) on stdout; 2 - blocking error,
+reason on stderr; 1 - release failure on SessionEnd, where there is nothing left
+to block. The code that lets a call through is never used for internal errors.
+
+Configuration, hook wiring and behaviour: https://github.com/y2k/emulator-router
+`
 
 // version заполняется при сборке (см. Makefile). Значение по умолчанию явное:
 // собранный без версии бинарь тоже надо уметь опознать в отчёте doctor.

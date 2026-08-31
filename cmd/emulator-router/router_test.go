@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
@@ -513,6 +516,124 @@ func TestSDKPathFromEnvironment(t *testing.T) {
 	}
 	if got := sdkPath("/home"); got != want {
 		t.Errorf("платформенное расположение: получено %q, ожидалось %q", got, want)
+	}
+}
+
+// Запрошенная справка — это результат работы, а не сообщение о неверном вызове:
+// иначе вызывающий скрипт видит отказ там, где отказа нет.
+func TestHelpIsSuccess(t *testing.T) {
+	for _, arg := range []string{"help", "--help", "-h"} {
+		c, f := newTestConfig(t)
+		var out, errOut bytes.Buffer
+		code := dispatch(ctxOf(c, f.run), []string{arg}, nil, &out, &errOut)
+		if code != 0 {
+			t.Errorf("%s: код=%d, ожидался 0 (stderr=%q)", arg, code, errOut.String())
+		}
+		if errOut.Len() != 0 {
+			t.Errorf("%s: справка не должна попадать в поток ошибок: %q", arg, errOut.String())
+		}
+		if !strings.Contains(out.String(), "usage:") {
+			t.Errorf("%s: справка должна быть на stdout: %q", arg, out.String())
+		}
+	}
+}
+
+// Вызов без аргументов — это status, а не справка: значение вызова без
+// аргументов изменение справки не затрагивает.
+func TestNoArgumentsRunsStatus(t *testing.T) {
+	c, f := newTestConfig(t)
+	seed(t, c, f, 15556, entry{Session: "s1", CWD: t.TempDir()})
+	var out, errOut bytes.Buffer
+	if code := dispatch(ctxOf(c, f.run), nil, nil, &out, &errOut); code != 0 {
+		t.Fatalf("код=%d stderr=%q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "emulator-15556") {
+		t.Errorf("ожидался вывод status: %q", out.String())
+	}
+	if strings.Contains(out.String(), "usage:") {
+		t.Errorf("справка выводиться не должна: %q", out.String())
+	}
+}
+
+// Неизвестная подкоманда остаётся ошибкой и не выглядит как успешный вызов:
+// вместо экрана справки — имя нераспознанного и указатель, как справку получить.
+func TestUnknownSubcommandIsError(t *testing.T) {
+	c, f := newTestConfig(t)
+	var out, errOut bytes.Buffer
+	code := dispatch(ctxOf(c, f.run), []string{"nosuch"}, nil, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("ожидался ненулевой код, получено %d", code)
+	}
+	if out.Len() != 0 {
+		t.Errorf("ошибочный вызов не должен ничего печатать на stdout: %q", out.String())
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "nosuch") {
+		t.Errorf("сообщение должно называть нераспознанное имя: %q", msg)
+	}
+	if !strings.Contains(msg, "--help") {
+		t.Errorf("сообщение должно указывать способ получить справку: %q", msg)
+	}
+	if strings.Contains(msg, "usage:") {
+		t.Errorf("сообщение не должно быть самой справкой: %q", msg)
+	}
+}
+
+// Подкоманда, отсутствующая в справке, для того, у кого нет доступа к
+// репозиторию, не существует, поэтому полноту перечня закрепляет тест, а не
+// аккуратность автора: метки берутся из самого разбора аргументов.
+//
+// ponytail: тест знает устройство dispatch() — единственный switch по строковым
+// меткам. При отказе от switch переписывается вместе с ним; таблица подкоманд в
+// проде дала бы гарантию по построению, но обошлась бы дороже самой справки.
+func TestHelpNamesEverySubcommand(t *testing.T) {
+	src, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var labels []string
+	for _, decl := range src.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "dispatch" {
+			continue
+		}
+		ast.Inspect(fn, func(n ast.Node) bool {
+			cl, ok := n.(*ast.CaseClause)
+			if !ok {
+				return true
+			}
+			for _, e := range cl.List {
+				if lit, ok := e.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					labels = append(labels, strings.Trim(lit.Value, `"`))
+				}
+			}
+			return true
+		})
+	}
+	if len(labels) == 0 {
+		t.Fatal("в dispatch() не найдено ни одной метки: разбор аргументов перестроен, тест надо переписать")
+	}
+
+	// Сверяется перечень, а не весь текст: имя подкоманды попадается и в
+	// поясняющих абзацах, и поиск по всему тексту пропустил бы выпавшую строку.
+	// Строка перечня — отступ, имена через запятую, два пробела, описание; за
+	// именем могут стоять его аргументы, поэтому берётся первое слово.
+	listed := map[string]bool{}
+	for line := range strings.SplitSeq(helpText, "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		names, _, _ := strings.Cut(strings.TrimSpace(line), "  ")
+		for part := range strings.SplitSeq(names, ", ") {
+			if fields := strings.Fields(part); len(fields) > 0 {
+				listed[fields[0]] = true
+			}
+		}
+	}
+	for _, name := range labels {
+		if !listed[name] {
+			t.Errorf("подкоманда %q не названа в перечне справки", name)
+		}
 	}
 }
 
