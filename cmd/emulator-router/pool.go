@@ -89,12 +89,42 @@ func logPath(ctx context.Context, port int) string { return entryPath(ctx, port)
 // если файл начнёт мешать.
 func logDecision(ctx context.Context, format string, args ...any) {
 	c := cfg(ctx)
-	f, err := os.OpenFile(filepath.Join(c.Registry, "router.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(journalPath(ctx), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 	fmt.Fprintf(f, "%s %s\n", c.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+}
+
+func journalPath(ctx context.Context) string {
+	return filepath.Join(cfg(ctx).Registry, "router.log")
+}
+
+// journalSince — хвост журнала, начиная с первой записи не старше окна. Хвост, а
+// не отбор записей по одной: строку, чьё время не разобралось, отбор потерял бы
+// молча, а журнал читают именно затем, чтобы понять, что произошло. Отсутствие
+// журнала — то же, что пустое окно: до первого решения файла нет.
+//
+// ponytail: писатели — разные процессы, поэтому запись, отставшая от границы
+// окна, попадёт в вывод вместе с хвостом. Лишняя строка дешевле потерянной;
+// вернуться к отбору по одной, если начнёт мешать.
+func journalSince(ctx context.Context, window time.Duration) string {
+	b, err := os.ReadFile(journalPath(ctx))
+	if err != nil {
+		return ""
+	}
+	since := cfg(ctx).Now().Add(-window)
+	lines := strings.SplitAfter(string(b), "\n")
+	for i, line := range lines {
+		stamp, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+		at, err := time.Parse(time.RFC3339, stamp)
+		if err != nil || at.Before(since) {
+			continue
+		}
+		return strings.Join(lines[i:], "")
+	}
+	return ""
 }
 
 func entries(ctx context.Context) []int {

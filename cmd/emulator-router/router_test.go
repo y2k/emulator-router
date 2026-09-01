@@ -654,6 +654,9 @@ func TestRegistrySubcommandsWorkWithoutSettings(t *testing.T) {
 	if code := dispatch(ctxOf(c, f.run), []string{"reap"}, nil, &out, &errOut); code != 0 {
 		t.Fatalf("reap: код=%d stderr=%q", code, errOut.String())
 	}
+	if code := dispatch(ctxOf(c, f.run), []string{"log"}, nil, &out, &errOut); code != 0 {
+		t.Fatalf("log: код=%d stderr=%q", code, errOut.String())
+	}
 }
 
 // Подкоманду acquire запускают руками и именно для этого каталога, поэтому здесь
@@ -2106,5 +2109,129 @@ func TestUnwritableLogDoesNotChangeOutcome(t *testing.T) {
 	}
 	if got := entries(ctx); len(got) != 0 {
 		t.Errorf("в реестре %v, ожидалась пустота", got)
+	}
+}
+
+// --- просмотр журнала ---
+
+// writeJournal подменяет журнал целиком: тестам нужны записи заданного возраста,
+// а не те, что сложились бы из вызовов.
+func writeJournal(t *testing.T, c config, lines ...string) {
+	t.Helper()
+	body := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(c.Registry, "router.log"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// record — запись журнала заданного возраста.
+func record(c config, age time.Duration, text string) string {
+	return c.Now().Add(-age).Format(time.RFC3339) + " " + text
+}
+
+// Журнал читают, чтобы понять, что произошло только что: записи старше окна
+// вытеснили бы то, за чем пришли.
+func TestLogPrintsOnlyRecordsInsideWindow(t *testing.T) {
+	c, f := newTestConfig(t)
+	writeJournal(t, c,
+		record(c, 30*time.Minute, "emulator-15556 launch session=old image=pooled_avd cwd=/w"),
+		record(c, 5*time.Minute, "emulator-15558 launch session=s1 image=pooled_avd cwd=/w"),
+		record(c, time.Minute, "emulator-15558 kill reason=release session=s1"),
+	)
+
+	var out, errOut bytes.Buffer
+	if code := dispatch(ctxOf(c, f.run), []string{"log", "10"}, nil, &out, &errOut); code != 0 {
+		t.Fatalf("код=%d stderr=%q", code, errOut.String())
+	}
+	got := out.String()
+	if strings.Contains(got, "session=old") {
+		t.Errorf("запись старше окна выведена: %q", got)
+	}
+	launch, kill := strings.Index(got, "launch session=s1"), strings.Index(got, "kill reason=release")
+	if launch < 0 || kill < 0 {
+		t.Fatalf("записи внутри окна должны быть выведены: %q", got)
+	}
+	if launch > kill {
+		t.Errorf("порядок записей должен остаться журнальным: %q", got)
+	}
+}
+
+// Окно по умолчанию обязано пережить предел простоя: иначе запуск инстанса и
+// вызванная простоем уборка окажутся в разных окнах, и исчезнувший инстанс
+// объяснить нечем.
+func TestLogDefaultWindowOutlivesIdleTimeout(t *testing.T) {
+	c, f := newTestConfig(t)
+	if c.LogWindow <= c.IdleTimeout {
+		t.Fatalf("окно по умолчанию %s не больше предела простоя %s", c.LogWindow, c.IdleTimeout)
+	}
+	writeJournal(t, c,
+		record(c, c.LogWindow+time.Minute, "emulator-15556 launch session=old image=pooled_avd cwd=/w"),
+		record(c, c.IdleTimeout+time.Minute, "emulator-15558 launch session=s1 image=pooled_avd cwd=/w"),
+		record(c, time.Minute, "emulator-15558 kill reason=idle session=s1 idle=6m0s"),
+	)
+
+	var out, errOut bytes.Buffer
+	if code := dispatch(ctxOf(c, f.run), []string{"log"}, nil, &out, &errOut); code != 0 {
+		t.Fatalf("код=%d stderr=%q", code, errOut.String())
+	}
+	got := out.String()
+	if strings.Contains(got, "session=old") {
+		t.Errorf("окно по умолчанию не применено: %q", got)
+	}
+	if !strings.Contains(got, "launch session=s1") || !strings.Contains(got, "reason=idle") {
+		t.Errorf("запуск и уборка по простою должны попасть в одно окно: %q", got)
+	}
+}
+
+// Молча принятое негодное окно дало бы пустой вывод, неотличимый от спокойного
+// пула: ошибочный вызов выглядел бы как отчёт.
+func TestLogRejectsBadWindow(t *testing.T) {
+	for _, arg := range []string{"abc", "-5", "3m"} {
+		c, f := newTestConfig(t)
+		writeJournal(t, c, record(c, 0, "emulator-15556 launch session=s1 image=pooled_avd cwd=/w"))
+
+		var out, errOut bytes.Buffer
+		code := dispatch(ctxOf(c, f.run), []string{"log", arg}, nil, &out, &errOut)
+		if code == 0 {
+			t.Errorf("%s: ожидался ненулевой код", arg)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: журнал не должен выводиться: %q", arg, out.String())
+		}
+		if errOut.Len() == 0 {
+			t.Errorf("%s: причина должна попасть в поток ошибок", arg)
+		}
+	}
+}
+
+// До первого решения журнала нет, и это то же самое, что пустое окно.
+func TestLogWithoutJournalIsEmptySuccess(t *testing.T) {
+	c, f := newTestConfig(t)
+	var out, errOut bytes.Buffer
+	if code := dispatch(ctxOf(c, f.run), []string{"log"}, nil, &out, &errOut); code != 0 {
+		t.Fatalf("код=%d stderr=%q", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Errorf("вывод должен быть пуст: %q", out.String())
+	}
+}
+
+// Строка, чьё время не разобралось, печатается вместе с хвостом: молча
+// выброшенная строка это потерянное решение, а журнал читают именно затем, чтобы
+// понять, что произошло.
+func TestLogKeepsLineWithoutTimestamp(t *testing.T) {
+	c, f := newTestConfig(t)
+	writeJournal(t, c,
+		record(c, 30*time.Minute, "emulator-15556 launch session=old image=pooled_avd cwd=/w"),
+		record(c, time.Minute, "emulator-15558 launch session=s1 image=pooled_avd cwd=/w"),
+		"emulator-15558 kill reason=release session=s1",
+	)
+
+	var out, errOut bytes.Buffer
+	if code := dispatch(ctxOf(c, f.run), []string{"log", "10"}, nil, &out, &errOut); code != 0 {
+		t.Fatalf("код=%d stderr=%q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "kill reason=release") {
+		t.Errorf("строка без времени после границы окна должна печататься: %q", out.String())
 	}
 }

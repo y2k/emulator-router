@@ -57,6 +57,10 @@ type config struct {
 	// настоящими сессиями. Оно заведомо не меньше времени загрузки — записи
 	// моложе его уборка по простою не трогает в любом случае.
 	IdleTimeout time.Duration
+	// LogWindow — окно просмотра журнала решений по умолчанию. Заведомо больше
+	// предела простоя: в окне должны оказаться рядом и запуск инстанса, и вызванная
+	// простоем уборка, иначе исчезнувший инстанс не объяснить.
+	LogWindow time.Duration
 	// ProcessGrace — запас, в течение которого отсутствие процесса инстанса не
 	// считается его гибелью. Программа эмулятора запускает qemu не мгновенно, и
 	// без запаса каждый запуск обрывался бы на первой же проверке.
@@ -88,6 +92,7 @@ func defaultConfig() config {
 		OfflineTimeout: 30 * time.Second,
 		AcquireWait:    480 * time.Second,
 		IdleTimeout:    300 * time.Second,
+		LogWindow:      30 * time.Minute,
 		ProcessGrace:   15 * time.Second,
 		Spawn:          spawn,
 		Signal:         syscall.Kill,
@@ -349,6 +354,19 @@ func dispatch(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 		reap(ctx)
 	case "status":
 		fmt.Fprint(stdout, statusText(ctx))
+	case "log":
+		window := cfg(ctx).LogWindow
+		if a := arg(0); a != "" {
+			// Здесь, в отличие от owner(), ошибка разбора не глотается: окно 0
+			// минут дало бы пустой вывод, неотличимый от спокойного пула.
+			m, err := strconv.Atoi(a)
+			if err != nil || m < 0 {
+				fmt.Fprintf(stderr, "log: %q is not a non-negative number of minutes\n", a)
+				return 1
+			}
+			window = time.Duration(m) * time.Minute
+		}
+		fmt.Fprint(stdout, journalSince(ctx, window))
 	case "help", "--help", "-h":
 		fmt.Fprint(stdout, helpText)
 	default:
@@ -376,6 +394,7 @@ usage: emulator-router [subcommand] [args]
   doctor [cwd]                      check the preconditions the pool depends on
   reap                              clear orphaned registry entries and copy-on-write layers
   status                            print held instances, owner liveness, idle time and working directory
+  log [minutes]                     print pool decisions from the last minutes (default 30)
   help, --help, -h                  print this help
 
 With no subcommand at all, status runs.
@@ -383,7 +402,7 @@ With no subcommand at all, status runs.
 acquire and doctor are run by hand for one directory, so they need the project
 settings file .claude/emulator-router.json found above it and fail without one.
 The other subcommands do not: hook stays silent in an unconfigured project, and
-status and reap only ever touch the registry.
+status, log and reap only ever touch the registry.
 
 hook exit codes: 0 - success, decision (if any) on stdout; 2 - blocking error,
 reason on stderr; 1 - release failure on SessionEnd, where there is nothing left

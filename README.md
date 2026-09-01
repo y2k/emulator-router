@@ -120,6 +120,7 @@ from.
 | `release <session> [owner]` | frees the session's instance |
 | `reap` | clears orphaned registry entries and copy-on-write layers |
 | `status` | prints held instances, owner liveness, idle time, and owner working directory |
+| `log [minutes]` | prints the pool decisions of the last minutes (default 30): launches, denials, kills |
 | `help` (`--help`, `-h`) | prints the same table, plus the exit codes below, from the binary itself |
 
 `hook` exit codes: `0` — success, decision (if any) on stdout; `2` — blocking
@@ -128,7 +129,7 @@ nothing left to block. The exit code that lets a tool call through is never used
 for internal errors: an unpinned call would land on an arbitrary device, possibly
 another session's.
 
-`status` and `reap` work anywhere — they only touch the registry, never the AVD.
+`status`, `log` and `reap` work anywhere — they only touch the registry, never the AVD.
 `acquire` and `doctor` need the settings file, since they are run by hand for a
 specific directory. A subcommand nobody recognizes is an error, not a help
 request: it names itself on stderr with exit code 1, while a requested help goes
