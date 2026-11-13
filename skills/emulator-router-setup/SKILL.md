@@ -117,8 +117,13 @@ file, or before writing it — inside a connected project the hook rewrites `-s`
 - `mainCheckout` — the pool serves linked worktrees only; `true` serves the main
   checkout too. Leave `false` when the main checkout is where a human uses their
   own device.
+- `dns` — optional, a domain whose names only the corporate DNS behind a VPN
+  resolves, e.g. `"corp.example"`. Set it when the app's backend or assets live
+  in such a zone: the emulator on macOS ignores the VPN's split-DNS resolvers.
+  Write the domain, never a server address — the router takes the server from
+  the machine (`scutil --dns`), and an address makes the file unusable.
 
-These three fields are the whole file. The instance cap and the renderer are
+These four fields are the whole file. The instance cap and the renderer are
 fixed by the binary, and any other field — those two included — makes the file
 unusable, which blocks every device call with exit code 2.
 

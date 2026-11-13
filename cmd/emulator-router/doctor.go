@@ -125,6 +125,7 @@ func staticChecks(ctx context.Context, cwd string) (config, report) {
 	r = append(r, wiringCheck(cwd)...)
 
 	ctx = cfgKey.With(ctx, c)
+	r = append(r, dnsCheck(ctx)...)
 	if avdExists(ctx) {
 		r.add(pass, "avd %q exists", c.AVD)
 	} else {

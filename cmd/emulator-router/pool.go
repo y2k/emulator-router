@@ -29,6 +29,9 @@ type entry struct {
 	// приходит из настроек проекта, поэтому без него инстанс прежнего образа
 	// выдавался бы как свой после обновления образа в настройках.
 	Image string `json:"image"`
+	// DNS — DNS-сервер, с которым инстанс запущен; пустой — без флага. Сверяется
+	// так же, как образ (см. foreign).
+	DNS string `json:"dns,omitempty"`
 	// LastSeen — время последней активности сессии, владеющей инстансом. Это
 	// единственный признак, отличающий брошенную сессию от работающей: владелец
 	// брошенной жив, процесс её инстанса жив, а у записи с неизвестным владельцем
@@ -404,16 +407,14 @@ func mine(ctx context.Context, session string, owner int, deadline time.Time) (i
 		if !ok {
 			continue
 		}
-		if e.Session != session && !(owner != 0 && e.OwnerPID == owner) {
+		if !owns(e, session, owner) {
 			continue
 		}
 		// Инстанс другого образа не свой: сессия просила один образ, а работала бы
 		// с другим молча. Освобождение, а не отказ: сессии нужен рабочий инстанс,
-		// и выдача тут же поднимет инстанс запрошенного образа. Освобождение при
-		// этом от образа не зависит — оно приходит с настройками по умолчанию, где
-		// образа нет, и попадает в эту же ветвь.
-		if e.Image != c.AVD {
-			killInstance(ctx, port, fmt.Sprintf("reason=image-mismatch was=%s want=%s session=%s", e.Image, c.AVD, e.Session))
+		// и выдача тут же поднимет инстанс запрошенного образа.
+		if why := foreign(ctx, e); why != "" {
+			killInstance(ctx, port, fmt.Sprintf("reason=%s session=%s", why, e.Session))
 			dropEntry(ctx, port)
 			continue
 		}
@@ -542,6 +543,7 @@ func bootingErr(port int) error {
 }
 
 func acquire(ctx context.Context, session string, owner int, cwd string) (id string, err error) {
+	ctx = withHostDNS(ctx)
 	c := cfg(ctx)
 	// Отказы пишутся в журнал одной точкой: путей отказа семь, и каждый из них
 	// заканчивается ошибкой. Перевод строки в причине сворачивается — состояние
@@ -609,18 +611,22 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (id str
 		CWD:        cwd,
 		Since:      c.Now().Unix(),
 		Image:      c.AVD,
+		DNS:        c.DNSServer,
 	}); err != nil {
 		return "", err
 	}
 
-	if err := c.Spawn(logPath(ctx, port), emu(ctx), "@"+c.AVD, "-read-only",
-		"-port", strconv.Itoa(port), "-gpu", c.GPU, "-no-window", "-no-audio", "-no-boot-anim"); err != nil {
+	if err := c.Spawn(logPath(ctx, port), emu(ctx), launchArgs(ctx, port)...); err != nil {
 		dropEntry(ctx, port)
 		return "", err
 	}
 	// Запуск пишется здесь, а не по готовности: место в пределе инстанс занимает
 	// уже сейчас, а неудачная загрузка допишет в журнал свой отказ.
-	logDecision(ctx, "%s launch session=%s image=%s cwd=%s", serial(port), session, c.AVD, cwd)
+	dns := ""
+	if c.DNSServer != "" {
+		dns = " dns=" + c.DNSServer
+	}
+	logDecision(ctx, "%s launch session=%s image=%s%s cwd=%s", serial(port), session, c.AVD, dns, cwd)
 
 	since := c.Now()
 	switch waitReady(ctx, port, since, since.Add(c.BootTimeout), deadline) {
@@ -638,6 +644,31 @@ func acquire(ctx context.Context, session string, owner int, cwd string) (id str
 		port, c.BootTimeout, logPath(ctx, port))
 }
 
+// launchArgs — аргументы запуска инстанса. Всё, чем инстанс отличается от
+// другого, складывается здесь, а сверяется в foreign.
+func launchArgs(ctx context.Context, port int) []string {
+	c := cfg(ctx)
+	args := []string{"@" + c.AVD, "-read-only", "-port", strconv.Itoa(port), "-gpu", c.GPU,
+		"-no-window", "-no-audio", "-no-boot-anim"}
+	if c.DNSServer != "" {
+		args = append(args, "-dns-server", c.DNSServer)
+	}
+	return args
+}
+
+// foreign — причина, по которой инстанс записи не свой для обрабатываемого
+// вызова, либо пустая строка, если свой.
+func foreign(ctx context.Context, e entry) string {
+	c := cfg(ctx)
+	if e.Image != c.AVD {
+		return fmt.Sprintf("image-mismatch was=%s want=%s", e.Image, c.AVD)
+	}
+	if e.DNS != c.DNSServer {
+		return fmt.Sprintf("dns-mismatch was=%s want=%s", orNone(e.DNS), orNone(c.DNSServer))
+	}
+	return ""
+}
+
 func avdExists(ctx context.Context) bool {
 	c := cfg(ctx)
 	out, err := run(ctx, emu(ctx), "-list-avds")
@@ -652,16 +683,22 @@ func avdExists(ctx context.Context) bool {
 	return false
 }
 
-// release завершает инстанс сессии, в том числе ещё загружающийся: сессии,
-// которая его заказала, больше нет, и доводить загрузку до конца незачем.
+// owns: запись принадлежит сессии либо её владельцу.
+func owns(e entry, session string, owner int) bool {
+	return e.Session == session || (owner != 0 && e.OwnerPID == owner)
+}
+
+// release завершает инстансы сессии в любом состоянии, в том числе ещё
+// загружающиеся. Идентичность не сверяется: освобождение приходит без настроек,
+// и причиной в журнале должно быть освобождение, а не несовпадение с ними.
 func release(ctx context.Context, session string, owner int) error {
-	port, st := mine(ctx, session, owner, time.Time{})
-	if st == foundNone {
-		return nil // освобождать нечего это успех
+	for _, port := range entries(ctx) {
+		if e, ok := readEntry(ctx, port); ok && owns(e, session, owner) {
+			killInstance(ctx, port, "reason=release session="+session)
+			dropEntry(ctx, port)
+		}
 	}
-	killInstance(ctx, port, "reason=release session="+session)
-	dropEntry(ctx, port)
-	return nil
+	return nil // освобождать нечего это тоже успех
 }
 
 func statusText(ctx context.Context) string {

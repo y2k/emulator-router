@@ -111,6 +111,7 @@ over the repository's.
 | `avd` | — | **Required.** Name of the prepared AVD the pool clones. No default exists. |
 | `reach` | `[]` | Extra command words that reach the emulator (see below). |
 | `mainCheckout` | `false` | Serve the main checkout too, not just linked worktrees. |
+| `dns` | — | Domain that needs the corporate DNS, e.g. `"corp.example"` (see below). |
 
 Only what differs between projects is configurable. The instance cap and the
 renderer are not: how many instances fit is a property of the machine's memory
@@ -120,15 +121,37 @@ Both are fixed at `3` and `host`, and setting either one in the file makes it
 unusable, exactly like a typo in a field name.
 
 A found-but-unusable file is a hard error: unparsable JSON, a missing `avd`, an
-unknown field, a wrong type, or an invalid `reach` pattern all block the tool
-call with exit code 2. A typo in a field name must not be indistinguishable from
-a working setting. Releasing an instance on `SessionEnd` does not need the file
-and happens regardless.
+unknown field, a wrong type, an invalid `reach` pattern, or an address in `dns`
+all block the tool call with exit code 2. A typo in a field name must not be
+indistinguishable from a working setting. Releasing an instance on `SessionEnd`
+does not need the file and happens regardless.
 
 Everything else — the registry directory (`~/.claude/emulator-router`), the
 console port range, all timeouts — is not project configuration and is not
 settable. The SDK location comes from `ANDROID_HOME` or `ANDROID_SDK_ROOT`, and
 otherwise from the platform's standard location.
+
+### Corporate DNS behind a VPN
+
+On macOS the emulator takes its DNS servers from `/etc/resolv.conf`, which lists
+only the machine's primary resolvers. The split-DNS resolvers a VPN adds for its
+zone (`scutil --dns`) never reach it, so names in that zone silently fail to
+resolve on the device while public names work.
+
+`dns` names the zone, not a server. On each hand-out the router looks up the
+resolver macOS itself would use for that domain — the most specific zone equal
+to it or containing it — and launches the instance with `-dns-server` set to
+that resolver's first server. With no such resolver (VPN off) the instance
+launches as usual. A server address in the field makes the file unusable: the
+address belongs to the machine's network, and committed to the repository it
+would leave the device with no DNS at all on a machine without the VPN.
+
+The device uses only the first DNS server it is given, so there is no fallback:
+the corporate server must also resolve public names. The server is part of the
+instance's identity, so switching the VPN on or off relaunches the instance on
+its next hand-out (`kill reason=dns-mismatch` in `log`), and whatever was
+installed on it is gone. `doctor` names the server it found, or warns that there
+is none. Other platforms have no `scutil`, so the field has no effect there.
 
 ### What counts as reaching the emulator
 

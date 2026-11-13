@@ -65,6 +65,10 @@ type config struct {
 	// считается его гибелью. Программа эмулятора запускает qemu не мгновенно, и
 	// без запаса каждый запуск обрывался бы на первой же проверке.
 	ProcessGrace time.Duration
+	// DNSDomain — из настроек проекта; DNSServer — сервер, найденный для него
+	// на машине при выдаче (см. withHostDNS). Пустой сервер — запуск без флага.
+	DNSDomain string
+	DNSServer string
 
 	// ponytail: четыре функции вместо перечисленного интерфейса из design.md.
 	// Тестируемость даёт шов, а не длина его описания; расширять до интерфейса,
@@ -131,6 +135,7 @@ type settings struct {
 	AVD          string   `json:"avd"`
 	Reach        []string `json:"reach"`
 	MainCheckout *bool    `json:"mainCheckout"`
+	DNS          *string  `json:"dns"`
 }
 
 // findSettings идёт вверх от cwd, отвечая за один проход на два вопроса: где
@@ -238,6 +243,11 @@ func applySettings(c config, path string) (config, error) {
 	c.AVD = s.AVD
 	if s.MainCheckout != nil {
 		c.MainCheckout = *s.MainCheckout
+	}
+	if s.DNS != nil {
+		if c.DNSDomain, err = dnsDomain(*s.DNS); err != nil {
+			return c, fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	for _, pat := range s.Reach {
 		re, err := regexp.Compile(commandPos + `(?:` + pat + `)`)

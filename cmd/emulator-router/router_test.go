@@ -446,25 +446,26 @@ func TestSettingsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AVD != "img" || c.Max != 3 || c.GPU != "host" || c.MainCheckout || len(c.Reach) != 0 {
+	if c.AVD != "img" || c.Max != 3 || c.GPU != "host" || c.MainCheckout || len(c.Reach) != 0 || c.DNSDomain != "" {
 		t.Errorf("дефолты не применились: %+v", struct {
 			AVD          string
 			Max          int
 			GPU          string
 			MainCheckout bool
 			Reach        int
-		}{c.AVD, c.Max, c.GPU, c.MainCheckout, len(c.Reach)})
+			DNSDomain    string
+		}{c.AVD, c.Max, c.GPU, c.MainCheckout, len(c.Reach), c.DNSDomain})
 	}
 }
 
 func TestSettingsOverrideDefaults(t *testing.T) {
 	dir := t.TempDir()
-	path := writeSettings(t, dir, `{"avd": "img", "mainCheckout": true, "reach": ["wrapper\\.sh"]}`)
+	path := writeSettings(t, dir, `{"avd": "img", "mainCheckout": true, "reach": ["wrapper\\.sh"], "dns": "Corp.Example."}`)
 	c, err := applySettings(defaultConfig(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.MainCheckout || len(c.Reach) != 1 {
+	if !c.MainCheckout || len(c.Reach) != 1 || c.DNSDomain != "corp.example" {
 		t.Errorf("настройки не применились: %+v", c)
 	}
 	// Предел и ускоритель настройками не переопределяются вовсе.
@@ -485,6 +486,11 @@ func TestSettingsRejectBadFiles(t *testing.T) {
 		{"задан предел инстансов", `{"avd": "img", "max": 3}`, "max"},
 		{"задан ускоритель графики", `{"avd": "img", "gpu": "host"}`, "gpu"},
 		{"задан предел простоя", `{"avd": "img", "idleTimeout": 300}`, "idleTimeout"},
+		// Адрес сервера — свойство сети машины, в репозитории он оставил бы
+		// инстанс без DNS на машине без VPN.
+		{"адрес вместо домена", `{"avd": "img", "dns": "192.0.2.53"}`, `"dns"`},
+		{"адрес IPv6 вместо домена", `{"avd": "img", "dns": "2001:db8::53"}`, `"dns"`},
+		{"пустой домен", `{"avd": "img", "dns": ""}`, `"dns"`},
 	}
 	for _, tc := range cases {
 		path := writeSettings(t, t.TempDir(), tc.body)
@@ -1714,6 +1720,45 @@ func TestOwnerUndefinedWhenNoSessionProcess(t *testing.T) {
 }
 
 // --- освобождение ---
+
+// Освобождение приходит без настроек (SessionEnd, doctor с доменом), поэтому
+// идентичность не сверяет: причиной в журнале должно быть освобождение, а не
+// несовпадение образа или DNS-сервера с пустыми настройками.
+func TestReleaseLogsReleaseNotMismatch(t *testing.T) {
+	c, f := newTestConfig(t)
+	c.DNSDomain = "corp.example"
+	out := scutilFixture
+	if _, err := acquire(ctxOf(c, withScutil(f, &out)), "s1", 0, "/w"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquire(ctxOf(c, withScutil(f, &out)), "s2", 0, "/w"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Как SessionEnd: настройки по умолчанию, без образа и домена.
+	bare := c
+	bare.AVD, bare.DNSDomain = "", ""
+	if err := release(ctxOf(bare, f.run), "s1", 0); err != nil {
+		t.Fatal(err)
+	}
+	// Как doctor: настройки с доменом, но сервер для них не определялся.
+	if err := release(ctxOf(c, f.run), "s2", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := len(entries(ctxOf(c, f.run))); n != 0 {
+		t.Errorf("оба инстанса должны быть освобождены, в реестре %d", n)
+	}
+	got := routerLog(t, c)
+	for _, want := range []string{"kill reason=release session=s1", "kill reason=release session=s2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("журнал не содержит %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "mismatch") {
+		t.Errorf("освобождение записано как несовпадение:\n%s", got)
+	}
+}
 
 func TestReleaseKillsInstanceAndRemovesLog(t *testing.T) {
 	c, f := newTestConfig(t)

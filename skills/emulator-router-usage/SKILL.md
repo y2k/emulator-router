@@ -44,6 +44,19 @@ whole command line: `adb wait-for-device && ./deploy.sh`.
 In the main checkout the pool stays out by default (`mainCheckout`), and the
 device there is the user's own.
 
+## Names behind a VPN do not resolve
+
+Hosts of a corporate zone answer `unknown host` on the device while public names
+work, and nothing logs an error — images fall back to placeholders, requests to
+those hosts fail. The emulator does not see the VPN's split DNS. The fix is the
+`dns` field in `.claude/emulator-router.json` (see emulator-router-setup), not an
+edit of the device's hosts file: that edit dies with the instance.
+
+With `dns` set, `emulator-router doctor` tells whether this machine has a
+resolver for the domain; none means the VPN is off. Switching
+the VPN on or off relaunches the instance on the next device call
+(`kill reason=dns-mismatch` in `emulator-router log`): reinstall the app.
+
 ## Denials
 
 A denial starts with "No emulator for this session:" or names a forbidden
