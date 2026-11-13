@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -587,6 +588,35 @@ func TestUnknownSubcommandIsError(t *testing.T) {
 // меткам. При отказе от switch переписывается вместе с ним; таблица подкоманд в
 // проде дала бы гарантию по построению, но обошлась бы дороже самой справки.
 func TestHelpNamesEverySubcommand(t *testing.T) {
+	labels := dispatchLabels(t)
+
+	// Сверяется перечень, а не весь текст: имя подкоманды попадается и в
+	// поясняющих абзацах, и поиск по всему тексту пропустил бы выпавшую строку.
+	// Строка перечня — отступ, имена через запятую, два пробела, описание; за
+	// именем могут стоять его аргументы, поэтому берётся первое слово.
+	listed := map[string]bool{}
+	for line := range strings.SplitSeq(helpText, "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		names, _, _ := strings.Cut(strings.TrimSpace(line), "  ")
+		for part := range strings.SplitSeq(names, ", ") {
+			if fields := strings.Fields(part); len(fields) > 0 {
+				listed[fields[0]] = true
+			}
+		}
+	}
+	for _, name := range labels {
+		if !listed[name] {
+			t.Errorf("подкоманда %q не названа в перечне справки", name)
+		}
+	}
+}
+
+// dispatchLabels: строковые метки switch в dispatch() — подкоманды, которые
+// бинарь распознаёт.
+func dispatchLabels(t *testing.T) []string {
+	t.Helper()
 	src, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -613,26 +643,63 @@ func TestHelpNamesEverySubcommand(t *testing.T) {
 	if len(labels) == 0 {
 		t.Fatal("в dispatch() не найдено ни одной метки: разбор аргументов перестроен, тест надо переписать")
 	}
+	return labels
+}
 
-	// Сверяется перечень, а не весь текст: имя подкоманды попадается и в
-	// поясняющих абзацах, и поиск по всему тексту пропустил бы выпавшую строку.
-	// Строка перечня — отступ, имена через запятую, два пробела, описание; за
-	// именем могут стоять его аргументы, поэтому берётся первое слово.
-	listed := map[string]bool{}
-	for line := range strings.SplitSeq(helpText, "\n") {
-		if !strings.HasPrefix(line, "  ") {
-			continue
+var (
+	inlineCodeRe = regexp.MustCompile("`[^`\n]+`")
+	invocationRe = regexp.MustCompile(`emulator-router[[:space:]]+([a-z-]+)`)
+)
+
+// Скилл, советующий несуществующую подкоманду, вреднее отсутствующего: Claude в
+// чужом проекте проверить совет не по чему. Вызовы ищутся только в коде — в
+// прозе «emulator-router is …» вызовом не является.
+func TestSkillsMatchBinary(t *testing.T) {
+	paths, _ := filepath.Glob("../../skills/*/SKILL.md")
+	if len(paths) == 0 {
+		t.Fatal("в ../../skills не найдено ни одного скилла: каталог переехал, тест надо поправить")
+	}
+	known := map[string]bool{}
+	for _, l := range dispatchLabels(t) {
+		known[l] = true
+	}
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
 		}
-		names, _, _ := strings.Cut(strings.TrimSpace(line), "  ")
-		for part := range strings.SplitSeq(names, ", ") {
-			if fields := strings.Fields(part); len(fields) > 0 {
-				listed[fields[0]] = true
+		text := string(b)
+		dir := filepath.Base(filepath.Dir(path))
+
+		front, _, ok := strings.Cut(strings.TrimPrefix(text, "---\n"), "\n---\n")
+		if !ok || !strings.HasPrefix(text, "---\n") {
+			t.Errorf("%s: нет заголовка между строками ---", path)
+		}
+		var name string
+		for line := range strings.SplitSeq(front, "\n") {
+			if v, ok := strings.CutPrefix(line, "name:"); ok {
+				name = strings.TrimSpace(v)
 			}
 		}
-	}
-	for _, name := range labels {
-		if !listed[name] {
-			t.Errorf("подкоманда %q не названа в перечне справки", name)
+		if name != dir {
+			t.Errorf("%s: name %q не совпадает с каталогом %q", path, name, dir)
+		}
+
+		// Чётные части между ``` — проза с инлайн-кодом, нечётные — блоки кода.
+		var code []string
+		for i, part := range strings.Split(text, "```") {
+			if i%2 == 1 {
+				code = append(code, part)
+			} else {
+				code = append(code, inlineCodeRe.FindAllString(part, -1)...)
+			}
+		}
+		for _, c := range code {
+			for _, m := range invocationRe.FindAllStringSubmatch(c, -1) {
+				if !known[m[1]] {
+					t.Errorf("%s: подкоманда %q не распознаётся бинарём", path, m[1])
+				}
+			}
 		}
 	}
 }
@@ -767,6 +834,9 @@ func TestConfiguredReachKeepsCommandPosition(t *testing.T) {
 		{"./wrapper.sh install", true},
 		{"cd app && ./scripts/wrapper.sh", true},
 		{"kotlin tools.main.kts status", true},
+		{"MIRROR=0 bash ./x/wrapper.sh 2>&1 | tail -15", true},
+		{"A=1 B= ./wrapper.sh", true},
+		{`echo "X=1 wrapper.sh"`, false},
 		{`echo "run wrapper.sh later"`, false},
 		{"grep -r wrapper.sh .", false},
 		{"./other.sh", false},
@@ -882,6 +952,7 @@ func TestReachRecognition(t *testing.T) {
 	reaching := []string{
 		"adb install app.apk",
 		"cd app && adb install app.apk",
+		"FOO=1 adb install app.apk",
 		"nohup emulator @other -read-only &",
 		"./gradlew installDebug",
 		"./gradlew connectedAndroidTest",
@@ -900,7 +971,7 @@ func TestReachRecognition(t *testing.T) {
 
 func TestDenyAdbRoot(t *testing.T) {
 	cwd := worktreeDir(t)
-	for _, cmd := range []string{"adb root", "adb -s emulator-5556 root", "cd app && adb root"} {
+	for _, cmd := range []string{"adb root", "adb -s emulator-5556 root", "cd app && adb root", "X=1 adb root"} {
 		c, f := newTestConfig(t)
 		seed(t, c, f, 15556, entry{Session: "s1", CWD: cwd})
 		code, out, _ := runHook(t, c, f, bashJSON(t, "s1", cwd, cmd))
@@ -923,6 +994,7 @@ func TestDenyWritableLaunchOfPooledAVD(t *testing.T) {
 		{"emulator @pooled_avd -no-window", true},
 		{"emulator -avd pooled_avd", true},
 		{"nohup emulator @pooled_avd &", true},
+		{"X=1 emulator @pooled_avd", true},
 		{"emulator @pooled_avd -read-only", false},
 		{"emulator @other_avd", false},
 	}

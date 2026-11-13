@@ -39,8 +39,8 @@ type hookOut struct {
 var (
 	probeRe  = regexp.MustCompile(`^[[:space:]]*adb[[:space:]]+(devices([[:space:]]+-l)?|version|start-server)[[:space:]]*$`)
 	reachRe  = regexp.MustCompile(commandPos + `(adb|emulator)[[:space:]]|gradlew.*(install|connected)`)
-	rootRe   = regexp.MustCompile(`(^|[;&|(){}]|&&|\|\|)[[:space:]]*([^[:space:]]*/)?adb([[:space:]]+-s[[:space:]]+[^[:space:]]+)?[[:space:]]+root([[:space:]]|$)`)
-	launchRe = regexp.MustCompile(`(^|[;&|(){}]|&&|\|\|)[[:space:]]*((nohup|bash|sh|zsh)[[:space:]]+)?([^[:space:]]*/)?emulator[[:space:]]`)
+	rootRe   = regexp.MustCompile(cmdStart + `([^[:space:]]*/)?adb([[:space:]]+-s[[:space:]]+[^[:space:]]+)?[[:space:]]+root([[:space:]]|$)`)
+	launchRe = regexp.MustCompile(cmdStart + `((nohup|bash|sh|zsh)[[:space:]]+)?([^[:space:]]*/)?emulator[[:space:]]`)
 	targetRe = regexp.MustCompile(`([^[:space:]]*adb)([[:space:]]+)-s[[:space:]]+[^[:space:]]+`)
 	anyEmuRe = regexp.MustCompile(`([^[:space:]]*adb)([[:space:]]+)-e([[:space:]])`)
 )

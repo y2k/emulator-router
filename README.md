@@ -9,7 +9,7 @@ never has to know its own serial: shell commands get it substituted in and
 exported, Mobile-MCP calls get their `device` argument rewritten.
 
 Requires macOS or Linux, an Android SDK, and a prepared AVD with a boot
-snapshot. Windows is not supported.
+snapshot (see [Prepare the AVD](#prepare-the-avd)). Windows is not supported.
 
 ## Install
 
@@ -43,6 +43,47 @@ session's launch and then for a boot, and the router gives up and denies the cal
 before its own budget runs out. A hook killed by the timeout does *not* block the
 call — it would run unrouted, on whatever device came first — so the timeout is
 kept above that budget rather than left at the default.
+
+## Prepare the AVD
+
+The pool never creates an AVD — it clones one you prepared. The recommended
+image is a **Google APIs** one (`google_apis`, not `google_apis_playstore`): Play
+images have no `su`, and `doctor` requires root for a single command. Pick the API
+level your app targets; the example below is API 36 on Apple silicon.
+
+```sh
+sdkmanager "emulator" "system-images;android-36;google_apis;arm64-v8a"
+avdmanager create avd -n agent_base -k "system-images;android-36;google_apis;arm64-v8a" -d pixel_3a
+```
+
+In `~/.android/avd/agent_base.avd/config.ini` set:
+
+```ini
+fastboot.forceColdBoot=no
+fastboot.forceFastBoot=yes
+hw.gpu.enabled=yes
+hw.gpu.mode=host
+hw.ramSize=4096
+```
+
+Then boot it once writable — with the same arguments the pool uses, minus
+`-read-only`, so the snapshot records the same renderer — and save the boot
+snapshot:
+
+```sh
+emulator @agent_base -port 5554 -gpu host -no-window -no-audio -no-boot-anim &
+adb -s emulator-5554 wait-for-device
+until [ "$(adb -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1 ]; do sleep 1; done
+adb -s emulator-5554 shell cmd bluetooth_manager disable   # optional, lands in every clone
+adb -s emulator-5554 emu avd snapshot save default_boot
+adb -s emulator-5554 emu kill
+```
+
+Do not run `adb root` before saving: a snapshot taken with a rooted adbd makes
+every clone fight over one adb identity. Anything you change in the guest before
+the save — settings, disabled Bluetooth — is what every instance starts from.
+After this, launch the AVD only with `-read-only`; `doctor` confirms the snapshot
+actually loads.
 
 ## Configure
 
@@ -92,7 +133,8 @@ otherwise from the platform's standard location.
 ### What counts as reaching the emulator
 
 Recognition requires the program name to sit in *command position* — at the start
-of the line or after a command separator — so the word `emulator` inside quoted
+of the line or after a command separator, optionally behind environment
+assignments like `MIRROR=0 ./run.sh` — so the word `emulator` inside quoted
 prose does not acquire an instance nobody asked for.
 
 The built-in core is `adb`, `emulator`, and `gradlew` in its install and
@@ -159,6 +201,27 @@ the same situation is silent by design, so this is the only place that can say
 "this project is not configured" out loud. A missing hook is the other half of the
 same silence — settings present, nothing calling the router — and every other
 check, including the live one, still passes. Both are violations for that reason.
+
+## Skills
+
+Two Claude Code skills in `skills/` teach an agent in another project what the
+hook alone does not tell it:
+
+| Skill | For |
+| --- | --- |
+| `emulator-router-setup` | connecting a project to the pool and repairing the connection, ending on `doctor` |
+| `emulator-router-usage` | device work in a connected project: the idle sweep, unpinned wrappers, what to do on each denial |
+
+They are self-contained and take their reference from the installed binary, so a
+skill directory can be linked into a project as is:
+
+```sh
+ln -s ~/src/emulator-router/skills/emulator-router-usage .claude/skills/
+echo .claude/skills/emulator-router-usage >> .git/info/exclude
+```
+
+Keep the link out of the project's history: an absolute link is broken for every
+other contributor. Copy the directory instead when the skill should be committed.
 
 ## Checks
 
