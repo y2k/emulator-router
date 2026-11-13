@@ -59,12 +59,12 @@ make run ARGS="status"    # go run с аргументами
 
 ## Спеки
 
-Проект ведётся по OpenSpec (`openspec/`): `specs/hook-routing`,
-`specs/emulator-pool`, `specs/pool-configuration` — действующее поведение,
+Проект ведётся по OpenSpec (`openspec/`): `specs/` — действующее поведение,
 `changes/` — предложенные изменения. Поведение меняется через изменение в
-`changes/` (`/opsx:propose`, `/opsx:apply`), а не правкой спеки напрямую.
-При `/opsx:archive` дельты спек синхронизируются в основные спеки без вопроса,
-если пользователь не сказал иного.
+`changes/` (скиллы `openspec-propose`, `openspec-apply-change`), а не правкой
+спеки напрямую. При архивации (`openspec-archive-change`) дельты спек
+синхронизируются в основные спеки без вопроса, если пользователь не сказал иного.
+Скиллы OpenSpec в репозиторий не входят: их ставит локально `openspec init`.
 
 ## Что важно не сломать
 
